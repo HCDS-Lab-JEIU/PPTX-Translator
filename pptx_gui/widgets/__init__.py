@@ -1,0 +1,1 @@
+"""Responsibility-separated Qt panels."""

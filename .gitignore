@@ -1,0 +1,33 @@
+.venv/
+__pycache__/
+*.pyc
+output/
+
+# Local source documents and personal editor/tool settings
+/ppt resource/
+/.vscode/
+/.idea/
+/.codex/
+/.aws/
+
+# Local secrets and authentication material
+.env
+.env.*
+!.env.example
+auth.json
+credentials.json
+token.json
+*.pem
+*.key
+*.pfx
+*.p12
+.npmrc
+.pypirc
+
+# Runtime logs
+*.log
+
+# Windows executable build environment and outputs
+/packaging/windows/.build-venv/
+/packaging/windows/build/
+/packaging/windows/dist/

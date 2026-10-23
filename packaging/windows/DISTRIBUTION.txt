@@ -1,0 +1,17 @@
+PPT Translator - Windows
+
+Extract the complete ZIP before launching PPTTranslator.exe.
+Keep the _internal folder beside the executable. Python is not required.
+
+Each user must install and sign in to their own AI CLI separately.
+Microsoft PowerPoint is required only for the optional layout review stage.
+No AI CLI, account credentials, source presentations or model quotas are bundled.
+
+Default output: %LOCALAPPDATA%\PPTTranslator\output\exports
+Choose another output directory in the PPT save node if preferred.
+Intermediate results: <chosen output directory>\.pptx-work\<job ID>
+
+To preview with mock data, run: PPTTranslator.exe --demo
+The demo performs no AI calls and writes no presentation.
+
+This build is unsigned. Verify the source of the distribution before running it.
