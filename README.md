@@ -4,6 +4,12 @@
 
 PowerPoint 파일의 텍스트를 번역하고, 원본 서식과 수식을 보존해 새 PPTX로 저장하는 Python + PySide6 데스크톱 앱입니다. 번역 후 레이아웃 조정을 선택적으로 실행할 수 있습니다.
 
+## 실행 화면
+
+![Windows EXE 실행 화면: 왼쪽 파일 목록, 가운데 번역·조정·저장 흐름, 오른쪽 노드 설정](docs/images/windows-app-layout.png)
+
+Windows EXE의 데모 화면입니다. 계정·모델·한도·파일은 모의 데이터이며 실제 AI 호출이나 PPT 저장을 하지 않습니다.
+
 ## 설치와 실행
 
 Python 3.10 이상이 필요합니다. 레이아웃 조정은 Windows와 Microsoft PowerPoint가 필요합니다.
