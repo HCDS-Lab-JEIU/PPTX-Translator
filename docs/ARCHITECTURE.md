@@ -26,6 +26,7 @@ Python + PySide6 네이티브 데스크톱 앱입니다. `ppt-ui-handoff/UI_SPEC
 | --- | --- |
 | `main.py` | PPTX 분석·추출·좌표·해시 및 독립 추출 CLI |
 | `pptx_text.py` | 텍스트·Office Math XML 처리 |
+| `pptx_styles.py` | 혼합 서식 구간 표시·검증과 원본 run 서식 대응 |
 | `translate_texts.py` | 번역 배치·응답 검증·보호 표시·텍스트 저장 |
 | `apply_translation.py` | 원본 ZIP 구조를 보존하며 번역 텍스트 적용 |
 | `gemini_cli.py` | 기존 Antigravity CLI 호출·사용량·stream-json 처리 |

@@ -11,6 +11,7 @@ import tempfile
 
 from gemini_cli import GeminiCLI, GeminiCLIError, EmptyModelResponseError
 from pptx_text import EQUATION, equation_lines
+from pptx_styles import MARKER, plain_text, validate_styles
 
 RECORD = re.compile(r"^(\[page=([1-9]\d*)\]\[[^\r\n]*?\])\[(.*)\]$")
 DEFAULT_MODEL = "gemini-3.8-flash-medium"
@@ -19,6 +20,11 @@ Translate every input text into clear, faithful English. Use consistent technica
 terminology across slide pages. Do not summarize, omit, or add information.
 Keep equations, numbers, variables, mathematical symbols, units, URLs, and names
 unchanged. Keep existing English when already correct. Preserve paragraph breaks.
+Markers [[STYLE_0]]...[[/STYLE_0]] identify source formatting spans. Translate the
+whole sentence naturally, moving each span with its corresponding meaning when
+word order changes. Keep every span id exactly once; never nest spans or move them
+across paragraph, line-break or equation boundaries. Keep all prose inside spans.
+Do not add Markdown bold. Markers are formatting metadata, not numeric content.
 Copy every numeric token exactly, with the same number of occurrences. Never spell
 numerals out as words (for example, keep 2 as 2, not two). Do not omit numbers.
 Placeholders such as [[EQ_1]] are protected native equations. Copy them verbatim,
@@ -40,6 +46,7 @@ class TextRecord:
     page: int
     prefix: str
     text: str
+    styled_text: str | None = None
 
 
 def read_records(path):
@@ -55,9 +62,15 @@ def parse_records(content):
         if match is None:
             raise ValueError(f"{line_number}행: 분석기의 [page][위치][텍스트] 형식이 아닙니다.")
         text = json.loads(match[3])
+        styled = None
+        if isinstance(text, dict):
+            styled = text.get("styled_text")
+            text = text.get("text")
+            if not isinstance(styled, str):
+                raise ValueError(f"{line_number}행: 서식 텍스트가 문자열이 아닙니다.")
         if not isinstance(text, str) or not text.strip():
             raise ValueError(f"{line_number}행: 비어 있지 않은 JSON 문자열이 필요합니다.")
-        records.append(TextRecord(len(records), int(match[2]), match[1], text))
+        records.append(TextRecord(len(records), int(match[2]), match[1], text, styled))
     return records
 
 
@@ -97,16 +110,21 @@ def parse_translations(response, records):
         translated[identifier] = text
     if set(translated) != expected:
         raise ValueError("일부 텍스트의 번역이 누락되었습니다.")
+    for record in records:
+        if record.styled_text:
+            validate_styles(record.styled_text, translated[record.id])
+        elif MARKER.search(translated[record.id]):
+            raise ValueError("원본에 없는 서식 표시입니다.")
     return translated
 
 
 def changed_numbers(record, translated):
     pattern = r"\d+(?:\.\d+)?"
-    return Counter(re.findall(pattern, record.text)) != Counter(re.findall(pattern, translated))
+    return Counter(re.findall(pattern, record.text)) != Counter(re.findall(pattern, plain_text(translated)))
 
 
 def changed_equations(record, translated):
-    return bool(EQUATION.search(record.text) or EQUATION.search(translated)) and equation_lines(record.text) != equation_lines(translated)
+    return bool(EQUATION.search(record.text) or EQUATION.search(translated)) and equation_lines(record.text) != equation_lines(plain_text(translated))
 
 
 def write_translation(destination, records, translations):
@@ -148,12 +166,12 @@ class PPTXTextTranslator:
         if extra: self.instructions = self.instructions.replace('Input records:\n', extra + '\nInput records:\n')
 
     def translate_batch(self, records):
-        payload = [{"id": r.id, "page": r.page, "text": r.text} for r in records]
+        payload = [{"id": r.id, "page": r.page, "text": r.styled_text or r.text} for r in records]
         result = self.cli.generate(self.instructions + json.dumps(payload, ensure_ascii=False), model=self.model)
         translated = parse_translations(result.stdout, records)
         incorrect = [r for r in records if changed_numbers(r, translated[r.id]) or changed_equations(r, translated[r.id])]
         if incorrect:
-            payload = [{"id": r.id, "page": r.page, "text": r.text} for r in incorrect]
+            payload = [{"id": r.id, "page": r.page, "text": r.styled_text or r.text} for r in incorrect]
             prompt = self.instructions + json.dumps(payload, ensure_ascii=False)
             prompt += "\nCritical: preserve ALL numeric tokens, equation placeholders and equation-containing line breaks verbatim."
             corrected = self.cli.generate(prompt, model=self.model)

@@ -22,6 +22,7 @@ from pptx.oxml.ns import qn
 from main import clean_text, file_sha256, text_records, walk_shapes
 from translate_texts import read_records
 from pptx_text import frame_text, equation_map, paragraph_text, math_text_nodes, MC
+from pptx_styles import MARKER, SPAN, plain_text, styled_frame, validate_styles
 
 KOREAN = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]")
 LOCATION = re.compile(
@@ -89,8 +90,28 @@ def match_translations(document, translated):
     return matches
 
 
-def replace_segment(nodes, translated, parent, anchor=None):
+def replace_segment(nodes, translated, parent, anchor=None, styles=None):
     """Unchanged fragments retain their original run formatting."""
+    if styles is not None and MARKER.search(translated):
+        insertion = list(parent).index(nodes[0].getparent()) if nodes else (
+            list(parent).index(anchor) if anchor is not None else len(parent))
+        for run in dict.fromkeys(node.getparent() for node in nodes):
+            parent.remove(run)
+        matches = list(SPAN.finditer(translated))
+        for index, match in enumerate(matches):
+            run = deepcopy(styles[match[1]])
+            run.tag = qn("a:r")
+            run.attrib.clear()
+            for text in run.findall(qn("a:t")):
+                run.remove(text)
+            text = OxmlElement("a:t")
+            start = 0 if index == 0 else match.start()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(translated)
+            text.text = plain_text(translated[start:end])
+            text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            run.append(text)
+            parent.insert(insertion + index, run)
+        return
     if not nodes:
         if translated:
             run = OxmlElement("a:r")
@@ -123,7 +144,7 @@ def replace_segment(nodes, translated, parent, anchor=None):
                 field.attrib.clear()
 
 
-def replace_paragraph(paragraph, translated, tokens=None):
+def replace_paragraph(paragraph, translated, tokens=None, styles=None):
     tokens = tokens or {}
     groups = [[]]
     breaks = []
@@ -146,10 +167,17 @@ def replace_paragraph(paragraph, translated, tokens=None):
     if len(groups) != len(lines):
         raise ValueError("문단 내 줄바꿈 매핑이 올바르지 않습니다.")
     for index, (nodes, text) in enumerate(zip(groups, lines)):
-        replace_segment(nodes, text, paragraph, breaks[index] if index < len(breaks) else None)
+        replace_segment(nodes, text, paragraph, breaks[index] if index < len(breaks) else None, styles)
 
 
 def replace_frame(frame, translated):
+    styles = None
+    if MARKER.search(translated):
+        source, templates = styled_frame(frame)
+        if source is None:
+            raise ValueError("원본에 없는 서식 표시입니다.")
+        validate_styles(source.replace("\v", "\n").strip("\n"), translated.replace("\v", "\n"))
+        styles = {key: deepcopy(value) for key, value in templates.items()}
     paragraphs = list(frame.paragraphs)
     tokens = equation_map(frame)
     active = [index for index, paragraph in enumerate(paragraphs) if paragraph_text(paragraph._p, tokens).strip()]
@@ -165,7 +193,7 @@ def replace_frame(frame, translated):
     if not changed_paragraphs:
         offset = 0
         for paragraph, count in zip(selected, counts):
-            replace_paragraph(paragraph._p, "\v".join(lines[offset:offset + count]), tokens)
+            replace_paragraph(paragraph._p, "\v".join(lines[offset:offset + count]), tokens, styles)
             offset += count
     else:
         # A changed paragraph count has no exact style correspondence.
@@ -192,7 +220,7 @@ def replace_frame(frame, translated):
             body.remove(paragraph._p)
         for offset, paragraph in enumerate(replacements):
             body.insert(insertion + offset, paragraph)
-    if clean_text(frame_text(frame)) != clean_text(translated):
+    if clean_text(frame_text(frame)) != clean_text(plain_text(translated)):
         raise ValueError("텍스트 교체 후 내용 검증에 실패했습니다.")
     return changed_paragraphs
 
@@ -280,6 +308,9 @@ def apply_translation(source, manifest="output/content.json", translations="outp
                 report["kept_non_korean"] += 1
                 continue
             shape = shapes[(page, expected["shape_id"])]
+            if (actual.get("styled_text") and translated != expected["text"]
+                    and not MARKER.search(translated)):
+                raise ValueError("혼합 서식 번역에 의미별 서식 표시가 없습니다. 원본을 다시 추출·번역하세요.")
             frame = (shape.table.cell(expected["row"] - 1, expected["column"] - 1).text_frame
                      if "row" in expected else shape.text_frame)
             if expected["kind"] == "math_text":

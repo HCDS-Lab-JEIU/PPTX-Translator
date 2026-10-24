@@ -69,7 +69,8 @@ class ApplyTranslationTests(unittest.TestCase):
         replacements = {"저항 R = 10 Ω\n두 번째 줄": "Resistance R = 10 Ω\nSecond line",
                         "전류": "Current", "Keep this English": "Model changed English"}
         write_translation(self.translations, self.records,
-                          {r.id: replacements.get(r.text, r.text) for r in self.records})
+                          {r.id: (r.styled_text.replace("저항", "Resistance").replace("두 번째 줄", "Second line")
+                                  if r.styled_text else replacements.get(r.text, r.text)) for r in self.records})
         self.destination = self.folder / "translated.pptx"
 
     def save_manifest(self):

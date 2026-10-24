@@ -11,6 +11,7 @@ import sys
 from zipfile import BadZipFile
 
 from pptx_text import frame_text, equation_map, math_text_nodes, shape_elements
+from pptx_styles import styled_frame
 
 try:
     from pptx import Presentation
@@ -135,6 +136,9 @@ def text_records(shape, matrix, page):
 
 
 def frame_records(record, frame):
+    styled, _ = styled_frame(frame)
+    if styled is not None:
+        record["styled_text"] = styled.replace("\v", "\n").strip("\n")
     equations = [{"token": token, "text": "".join(node.text or "" for node in math_text_nodes_in_root(root))}
                  for root, token in equation_map(frame).items()]
     if equations:
@@ -143,7 +147,7 @@ def frame_records(record, frame):
     for index, node in enumerate(math_text_nodes(frame), 1):
         if re.search(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]", node.text or ""):
             yield {**record, "kind": "math_text", "math_text_index": index, "text": node.text,
-                   "is_title": False}
+                   "is_title": False, "styled_text": None}
 
 
 def math_text_nodes_in_root(root):
@@ -244,7 +248,7 @@ def extract_pptx(source, output_dir):
         slides.append(result)
     removed = filter_texts(slides, width, height)
     document = {
-        "source": source.name, "source_sha256": file_sha256(source), "text_schema_version": 2,
+        "source": source.name, "source_sha256": file_sha256(source), "text_schema_version": 3,
         "coordinate_unit": "cm",
         "coordinate_origin": "top-left", "slide_size_cm": {"width": width, "height": height},
         "removed_text_count": omitted_placeholders + removed,
@@ -265,8 +269,10 @@ def format_text(document):
                 location += f"; table={record['shape_id']},row={record['row']},col={record['column']}"
             if "math_text_index" in record:
                 location += f"; math_text={record['math_text_index']}"
+            content = ({"text": record["text"], "styled_text": record["styled_text"]}
+                       if record.get("styled_text") else record["text"])
             lines.append(f"[page={slide['page']}][{location}]"
-                         f"[{json.dumps(record['text'], ensure_ascii=False)}]")
+                         f"[{json.dumps(content, ensure_ascii=False)}]")
     return "\n".join(lines) + ("\n" if lines else "")
 
 
