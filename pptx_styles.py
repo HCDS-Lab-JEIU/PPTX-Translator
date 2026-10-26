@@ -12,6 +12,22 @@ def plain_text(text):
     return MARKER.sub("", text)
 
 
+def relaxed_styles(source, translated):
+    """Accept known, nonnested semantic spans without requiring every source run.
+
+    A translated particle need not have a separate nonempty formatting span.
+    Layout/paragraph locations are checked at application, not as translation failure.
+    """
+    expected = {match[1] for match in SPAN.finditer(source)}
+    spans = list(SPAN.finditer(translated))
+    identifiers = [match[1] for match in spans]
+    if not spans or len(set(identifiers)) != len(identifiers) or not set(identifiers) <= expected:
+        return False
+    outside = re.sub(r'\[\[EQ_\d+\]\]', '', SPAN.sub('', translated))
+    return not outside.strip() and all(match[2] and not MARKER.search(match[2])
+        and not re.search(r'[\n\r\v]|\[\[EQ_\d+\]\]', match[2]) for match in spans)
+
+
 def styled_frame(frame):
     """Return marked prose and original run templates, only for mixed formatting."""
     from lxml import etree

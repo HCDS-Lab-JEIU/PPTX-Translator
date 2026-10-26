@@ -1,5 +1,6 @@
 """Resumable file/page scheduler. No Qt widgets, account tokens, or raw RPC logs."""
 from copy import deepcopy
+from collections import Counter
 import hashlib
 import json
 from pathlib import Path
@@ -146,6 +147,7 @@ class DesktopEngine:
         if state['source_sha256'] != source_hash: raise ValueError('원본이 변경되어 체크포인트를 재사용할 수 없습니다.')
         if state['fingerprint'] != fingerprint: raise ValueError('설정이 변경됐습니다. 재실행으로 새 작업을 시작하세요.')
         state.setdefault('translation_failures', [])
+        state.setdefault('translation_deferred', [])
         state.setdefault('application_report', {})
         def save_state():
             temp = state_file.with_suffix('.tmp')
@@ -172,6 +174,26 @@ class DesktopEngine:
         self.emit({'type':'analyzed','job':job.id,'pages':pages,'workdir':str(workdir)})
         stage('extract','done')
         records = read_records(context.texts)
+        if state.get('translation_validation_version', 0) < 2:
+            # Retry only previously discarded items when resuming an older checkpoint.
+            # Keep all successful translations and retain the prior failure history.
+            old_failures = state['translation_failures']
+            retry_ids = {item['record_id'] for item in old_failures if 'record_id' in item}
+            if not retry_ids and state['translation_failed']:
+                retry_ids = {r.id for r in records if r.page in state['translation_failed']}
+            if retry_ids:
+                for identifier in retry_ids:
+                    state['translated'].pop(str(identifier), None)
+                state.setdefault('prior_translation_failures', []).extend(old_failures)
+                state['translation_failures'] = []
+                state['translation_failed'] = []
+                state['applied'] = False
+                state['application_report'] = {}
+                state.pop('current_pptx', None)
+                state['adjusted_pages'] = []
+                state['review_reports'] = []
+            state['translation_validation_version'] = 2
+            save_state()
         translations = {int(k):v for k,v in state['translated'].items()}
         stage('translate','running' if cfg.translate.enabled else 'skipped')
         # Extraction already supplies stable IDs and page locations. Network requests
@@ -188,18 +210,26 @@ class DesktopEngine:
             if batch:
                 def translate_batch():
                     options = self.current_settings.translate
-                    if not options.enabled: return {r.id:r.text for r in batch}, []
+                    if not options.enabled: return {r.id:r.text for r in batch}, [], []
                     translator = PPTXTextTranslator(self.provider(options), model=None,
                         source_language=options.source_language,target_language=options.target_language,
                         glossary=options.glossary,additional_instructions=options.prompt, recover=True)
                     translated = translator.translate_batch(batch)
-                    return translated, translator.failures
-                translated, failures = self.unit(translate_batch)
+                    return translated, translator.failures, translator.deferred
+                translated, failures, deferred = self.unit(translate_batch)
+                if deferred:
+                    state['translation_deferred'].extend(deferred)
+                    self.emit({'type':'warning','message':f'{len(deferred)}개 항목 번역 유지 · 서식·줄바꿈 복구 기록'})
                 if failures:
                     failed_pages = sorted({item['page'] for item in failures})
                     state['translation_failed'] = sorted(set(state['translation_failed']) | set(failed_pages))
                     state['translation_failures'].extend(failures)
-                    self.emit({'type':'warning','message':f'{failed_pages}페이지 번역 검증 실패 · {len(failures)}개 항목 원문 유지'})
+                    labels = {'empty_text':'빈 번역','empty_response':'빈 응답','invalid_json':'응답 형식 오류',
+                        'missing_id':'응답 항목 누락','duplicate_id':'응답 ID 중복','numeric_mismatch':'숫자 불일치',
+                        'equation_marker_mismatch':'수식 표시 불일치','equation_structure_mismatch':'수식 구조 불일치'}
+                    reasons = Counter(item['reason'] for item in failures)
+                    details = ', '.join(f'{labels.get(reason, reason)} {count}개' for reason,count in reasons.items())
+                    self.emit({'type':'warning','message':f'{failed_pages}페이지 번역 미완료 · 원문 유지 ({details})'})
                 translations.update(translated)
                 state['translated'] = {str(k):v for k,v in translations.items()}
                 save_state()
@@ -276,7 +306,8 @@ class DesktopEngine:
                         or any(r['status']=='needs_review' for r in state['review_reports']))
         result = {'output':str(target),'status':'needs_review' if needs_review else 'done','slides':pages,
             'translation_failed_pages':state['translation_failed'],'review_reports':state['review_reports'],
-            'translation_failures':state['translation_failures'],'application_report':state['application_report'],
+            'translation_failures':state['translation_failures'],'translation_deferred':state['translation_deferred'],
+            'application_report':state['application_report'],
             'checkpoint':str(state_file)}
         with target.with_suffix('.report.json').open('x',encoding='utf-8') as output_report:
             json.dump(result,output_report,ensure_ascii=False,indent=2)

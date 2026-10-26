@@ -18,7 +18,7 @@ from pptx.oxml.xmlchemy import OxmlElement
 from main import bbox, walk_shapes, clean_text, file_sha256
 from apply_translation import KOREAN, replace_frame, sync_text_fallback
 from pptx_styles import styled_frame
-from .layout_overview import overview_sheets, metric_candidates, screen_document
+from .layout_overview import damage_pages, overview_sheets, metric_candidates, screen_document
 from .layout_text import validate_compression
 from .layout_cache import render_cached
 from pptx_text import A, M, MC, frame_text, equation_roots
@@ -408,7 +408,7 @@ class PPTXLayoutModifier:
         shutil.copy2(source, preview)
         screening = None
         review_key = {'source_sha256': file_sha256(source), 'reference_sha256': file_sha256(reference),
-                      'policy': asdict(self.policy), 'pages': pages}
+                      'policy': asdict(self.policy), 'pages': pages, 'review_version': 2}
         if self.overview:
             if progress:
                 progress('전체 슬라이드 미리보기 일괄 검토')
@@ -430,8 +430,13 @@ class PPTXLayoutModifier:
                              'contact_sheets': [str(path) for path in sheets], 'metric_candidates': candidates,
                              'key': review_key}
             except (ValueError, RuntimeError) as exc:
-                # An uncertain/failed overview must not silently exclude pages.
-                screening = {'selected_pages': pages, 'failed': True, 'error_type': type(exc).__name__}
+                # Screening failure must neither label the deck verified nor force
+                # every slide through expensive repair without evidence of damage.
+                pending_pages = damage_pages(candidates)
+                latest_reviews = {page: {'page': page, 'needs_changes': page in pending_pages,
+                    'review_failed': True, 'issues': ['전체 선별 검토 실패 · 자동 수정 보류']} for page in pages}
+                screening = {'selected_pages': pending_pages, 'failed': True, 'error_type': type(exc).__name__,
+                             'unverified_pages': pages, 'metric_candidates': candidates}
                 failures.append({'stage': 'overview', 'pages': pages, 'error_type': type(exc).__name__})
             (workdir / 'screening.json').write_text(json.dumps(screening, ensure_ascii=False, indent=2), encoding='utf-8')
             boundary()
@@ -540,7 +545,7 @@ class PPTXLayoutModifier:
                   "failures": failures,
                   "screening": screening, "text_compressions": compressions,
                   "preview_pptx": str(preview),
-                  "status": "needs_review" if unresolved or compressions else "verified",
+                  "status": "needs_review" if unresolved or compressions or len(reviewed_pages) != len(pages) else "verified",
                   "unresolved": unresolved, "history": history,
                   "final_images": {str(page): str(path) for page, path in current_render.images.items()},
                   "provider": type(self.provider).__name__, "model": getattr(self.provider, "model", None),

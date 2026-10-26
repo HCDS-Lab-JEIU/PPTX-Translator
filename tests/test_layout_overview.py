@@ -14,7 +14,7 @@ from main import extract_pptx
 from pptx_pipeline.ai import AIResponse
 from pptx_pipeline.layout import (LayoutPolicy, PPTXLayoutModifier, inspect_layout,
                                   apply_layout_changes, text_and_math_signature)
-from pptx_pipeline.layout_overview import metric_candidates
+from pptx_pipeline.layout_overview import damage_pages, metric_candidates
 from pptx_pipeline.layout_text import validate_compression
 from pptx_gui.engine import Stopped
 from tests.test_pipeline import FakeRenderer
@@ -49,7 +49,9 @@ class OverviewTests(unittest.TestCase):
                         return AIResponse('{"reviews":[]}', tuple(images))
                     pages = json.loads(prompt.split('Do not use tools or modify files.\n')[1])['pages']
                     return AIResponse(json.dumps({'reviews':[{'page': p, 'needs_changes': p in selected,
-                        'issues': ['wrap'] if p in selected else []} for p in pages]}), tuple(images))
+                        'issues': ['overlap'] if p in selected else [],
+                        'defects': [{'kind':'overlap','evidence':'New body text obscures a diagram label'}]
+                            if p in selected else []} for p in pages]}), tuple(images))
                 data = json.loads(prompt[prompt.index('{"images":'):])
                 pages = [slide['page'] for slide in data['slides']]
                 editing = not any('after_' in str(image) for image in images)
@@ -91,14 +93,17 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(report['status'], 'verified')
         self.assertEqual(report['reviewed_pages'], list(range(1, 13)))
 
-    def test_failed_screen_does_not_skip_any_pages(self):
+    def test_failed_screen_marks_unverified_without_repairing_entire_deck(self):
         provider = self.provider(reject_screen=True)
         report, renderer = self.modify(provider)
         self.assertTrue(report['screening']['failed'])
-        self.assertEqual(renderer.requested_pages[-1], list(range(1, 13)))
-        self.assertEqual(report['reviewed_pages'], list(range(1, 13)))
+        self.assertEqual(len(renderer.calls), 2)
+        self.assertEqual(report['reviewed_pages'], [])
+        self.assertEqual(report['unreviewed_pages'], list(range(1, 13)))
+        self.assertEqual(report['screening']['selected_pages'], [])
+        self.assertEqual(report['status'], 'needs_review')
 
-    def test_one_line_to_two_lines_is_selected_even_without_overflow(self):
+    def test_one_line_to_two_lines_is_only_advisory_without_overflow(self):
         renderer = FakeRenderer()
         before = renderer.render(self.source, self.root / 'before')
         after = deepcopy(before)
@@ -106,6 +111,7 @@ class OverviewTests(unittest.TestCase):
         after.slides[4]['text_metrics'][0].update(line_count=2, overflow=False)
         candidates = metric_candidates(before, after, list(range(1, 13)))
         self.assertEqual(list(candidates), [4])
+        self.assertEqual(candidates[4][0]['severity'], 'advisory')
 
     def test_optional_compression_is_applied_and_reported(self):
         provider = self.provider(selected=(2,), compression='Current is 10 mA')
@@ -196,3 +202,51 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(result.text, 'Current is 10 mA')
         self.assertEqual(result.text_frame.paragraphs[0].runs[-1].text, '10 mA')
         self.assertTrue(result.text_frame.paragraphs[0].runs[-1].font.bold)
+
+    def test_wrapping_or_uncertainty_without_visible_damage_never_starts_repair(self):
+        class OvercautiousProvider:
+            calls = 0
+            def generate(inner, prompt, *, images=()):
+                inner.calls += 1
+                self.assertIn('Screen the whole presentation', prompt)
+                return AIResponse(json.dumps({'reviews':[{'page':p,'needs_changes':True,
+                    'issues':['one line became two / thumbnail uncertain'],
+                    'defects':[{'kind':'wrapping','evidence':'still fits the box'}]}
+                    for p in range(1, 13)]}), tuple(images))
+        provider = OvercautiousProvider()
+        report, renderer = self.modify(provider)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(len(renderer.calls), 2)
+        self.assertEqual(report['screening']['selected_pages'], [])
+
+    def test_only_material_overflow_overrides_visual_no_change(self):
+        renderer = FakeRenderer()
+        before = renderer.render(self.source, self.root / 'metric-reference')
+        after = deepcopy(before)
+        for page in (2, 3):
+            before.slides[page]['text_metrics'][0]['overflow'] = False
+            after.slides[page]['text_metrics'][0].update(overflow=True, available_height_pt=100,
+                                                       bound_height_pt=102 if page == 2 else 120)
+        after.slides[4]['text_metrics'][0]['metric_error'] = True
+        candidates = metric_candidates(before, after, list(range(1, 13)))
+        self.assertEqual(damage_pages(candidates), [3])
+
+    def test_failed_overview_repairs_only_material_overflow_and_marks_rest_unverified(self):
+        class OverflowRenderer(FakeRenderer):
+            def render(inner, source, directory, *, pages=None):
+                result = super().render(source, directory, pages=pages)
+                for page, slide in result.slides.items():
+                    for metric in slide['text_metrics']:
+                        metric['overflow'] = False
+                        if Path(directory).name == 'before' and page == 5:
+                            metric.update(overflow=True, available_height_pt=100, bound_height_pt=150)
+                return result
+        renderer = OverflowRenderer()
+        provider = self.provider(reject_screen=True)
+        report = PPTXLayoutModifier(provider, renderer, policy=LayoutPolicy(max_passes=1)).modify(
+            self.source, self.root / 'overflow-result.pptx', reference=self.source,
+            manifest=self.manifest, workdir=self.root / 'overflow-work')
+        self.assertEqual(report['screening']['selected_pages'], [5])
+        self.assertEqual(renderer.requested_pages[-1], [5])
+        self.assertEqual(report['reviewed_pages'], [5])
+        self.assertEqual(report['status'], 'needs_review')

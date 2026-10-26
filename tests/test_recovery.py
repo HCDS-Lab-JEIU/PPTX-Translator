@@ -30,10 +30,11 @@ class RecoveryTests(unittest.TestCase):
             {'id': 1, 'text': '20 V'}, {'id': 2, 'text': 'Voltage'}]),
             response([{'id': 1, 'text': '10 volts'}, {'id': 2, 'text': 'Voltage'}])]
         translator = PPTXTextTranslator(cli, recover=True)
-        self.assertEqual(translator.translate_batch(records), {0: 'Current', 1: '10 volts', 2: '전압'})
+        self.assertEqual(translator.translate_batch(records), {0: 'Current', 1: '10 volts', 2: 'Voltage'})
         retried = json.loads(cli.generate.call_args.args[0].split('Input records:\n')[1].split('\nRetry:')[0])
-        self.assertEqual([r['id'] for r in retried], [1, 2])
-        self.assertEqual([r['record_id'] for r in translator.failures], [2])
+        self.assertEqual([r['id'] for r in retried], [1])
+        self.assertEqual(translator.failures, [])
+        self.assertEqual([r['record_id'] for r in translator.deferred], [2])
 
     def test_malformed_missing_duplicate_and_empty_responses_keep_original(self):
         record = TextRecord(0, 1, '', '전압 10 V')
@@ -50,13 +51,15 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(cli.generate.call_count, 2)
                 self.assertEqual(len(translator.failures), 1)
 
-    def test_equation_line_break_failure_keeps_original(self):
+    def test_equation_line_break_is_restored_without_discarding_translation(self):
         record = TextRecord(0, 1, '', '전압\n[[EQ_1]]')
         cli = Mock()
         cli.generate.return_value = response([{'id': 0, 'text': 'Voltage [[EQ_1]]'}])
         translator = PPTXTextTranslator(cli, recover=True)
-        self.assertEqual(translator.translate_batch([record]), {0: record.text})
-        self.assertEqual(len(translator.failures), 1)
+        self.assertEqual(translator.translate_batch([record]), {0: 'Voltage\n[[EQ_1]]'})
+        self.assertEqual(translator.failures, [])
+        self.assertEqual(cli.generate.call_count, 1)
+        self.assertIn('equation_lines_restored', translator.deferred[0]['reasons'])
 
     def make_source(self, folder):
         source = folder / 'source.pptx'
@@ -79,11 +82,11 @@ class RecoveryTests(unittest.TestCase):
             texts.write_text(format_text(document), encoding='utf-8')
             translated = root / 'translated.txt'
             write_translation(translated, read_records(texts), {0: 'Current', 1: 'Voltage'})
-            def fail_after_mutation(frame, text):
+            def fail_after_mutation(frame, text, **kwargs):
                 if text == 'Current':
                     frame.text = 'CORRUPTED'
                     raise ValueError('simulated post-mutation verification failure')
-                return replace_frame(frame, text)
+                return replace_frame(frame, text, **kwargs)
             with patch('apply_translation.replace_frame', side_effect=fail_after_mutation):
                 report = apply_translation(source, manifest, translated, root / 'result.pptx', recover=True)
             result = Presentation(root / 'result.pptx')

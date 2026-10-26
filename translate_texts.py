@@ -12,6 +12,7 @@ import tempfile
 from gemini_cli import GeminiCLI, GeminiCLIError, EmptyModelResponseError
 from pptx_text import EQUATION, equation_lines
 from pptx_styles import MARKER, plain_text, validate_styles
+from translation_validation import TranslationValidationError, prepare_translation
 
 RECORD = re.compile(r"^(\[page=([1-9]\d*)\]\[[^\r\n]*?\])\[(.*)\]$")
 DEFAULT_MODEL = "gemini-3.8-flash-medium"
@@ -167,6 +168,7 @@ class PPTXTextTranslator:
         self.batch_chars = batch_chars
         self.recover = recover
         self.failures = []
+        self.deferred = []
         self.instructions = INSTRUCTIONS
         if target_language != "English":
             self.instructions = self.instructions.replace('professional English translator', f'professional {target_language} translator')
@@ -199,41 +201,69 @@ class PPTXTextTranslator:
         """Retry only invalid records once; never publish unsafe text or raw responses."""
         translated = {}
         pending = list(records)
+        errors = {}
         for attempt in range(2):
             if not pending:
                 break
             payload = [{"id": r.id, "page": r.page, "text": r.styled_text or r.text} for r in pending]
-            prompt = self.instructions + json.dumps(payload, ensure_ascii=False)
+            instructions = self.instructions
+            instructions = instructions.replace(
+                'Keep every span id exactly once; never nest spans or move them\n'
+                'across paragraph, line-break or equation boundaries. Keep all prose inside spans.',
+                'Preserve known spans when practical; grammatical fragments may be merged or omitted.\n'
+                'Never sacrifice translated prose to reproduce source formatting.')
+            instructions = instructions.replace(
+                'in the same order and on the same paragraph/line. Never translate, delete, expand,\n'
+                'or move a placeholder. For records with equation placeholders, preserve ALL line\n'
+                'breaks exactly (including blank lines). Prose inside an equation is a separate record.',
+                'in the same order. Never translate, delete, expand, or move them across prose.\n'
+                'Keep useful paragraph structure; exact visual line wrapping is handled later.\n'
+                'Prose inside an equation is a separate record.')
             if attempt:
-                prompt += "\nRetry: preserve every style span, number, equation and structural line break exactly."
+                extra = 'Retry only these IDs. Failure codes: ' + json.dumps(errors)
+                extra += '\nReturn nonempty translations and preserve all numbers and equation markers. '
+                extra += 'Formatting spans are best effort: do not omit translated prose to satisfy style markers.'
+            else:
+                extra = 'Formatting spans are best effort. Missing/empty grammatical spans or changed prose '
+                extra += 'line breaks are acceptable. Preserve translated meaning, numeric tokens and equation markers.'
+            instructions = instructions.replace('Input records:\n', extra + '\nInput records:\n')
+            prompt = instructions + json.dumps(payload, ensure_ascii=False)
             try:
                 response = self.cli.generate(prompt, model=self.model)
             except EmptyModelResponseError:
                 items = []
+                envelope_error = 'empty_response'
             else:
                 try:
                     items = translation_items(response.stdout)
+                    envelope_error = None
                 except ValueError:
                     items = []
+                    envelope_error = 'invalid_json'
             retry = []
             for record in pending:
                 candidates = [item for item in items if isinstance(item, dict)
                               and type(item.get('id')) is int and item['id'] == record.id]
                 try:
-                    result = parse_translations(json.dumps({'translations': candidates}), [record])
-                    text = result[record.id]
-                    if changed_numbers(record, text) or changed_equations(record, text):
-                        raise ValueError('숫자·수식 또는 줄바꿈 불일치')
-                except ValueError:
+                    if len(candidates) != 1:
+                        raise TranslationValidationError(envelope_error or ('missing_id' if not candidates else 'duplicate_id'))
+                    text, notes = prepare_translation(record, candidates[0].get('text'))
+                    if changed_numbers(record, text):
+                        raise TranslationValidationError('numeric_mismatch')
+                except TranslationValidationError as exc:
+                    errors[record.id] = exc.code
                     retry.append(record)
                 else:
                     translated[record.id] = text
+                    if notes:
+                        self.deferred.append({'page': record.page, 'record_id': record.id,
+                            'reasons': notes, 'action': 'translated_with_formatting_recovery'})
             pending = retry
         for record in pending:
             # Plain source text means "keep unchanged" to the applier, including mixed runs.
             translated[record.id] = record.text
             self.failures.append({'page': record.page, 'record_id': record.id,
-                                  'reason': '번역 응답 또는 서식·숫자·수식·줄바꿈 검증 실패',
+                                  'reason': errors[record.id],
                                   'action': 'kept_original'})
         return translated
 
@@ -253,6 +283,7 @@ class PPTXTextTranslator:
                   "records": len(records), "batches": len(batches),
                   "model": self.model or getattr(self.cli, "model", None), "status": "running",
                   "completed_batches": 0, "failed_pages": [], "failures": failures}
+        report['formatting_deferred'] = self.deferred
         def save_progress():
             completed = [r for r in records if r.id in translations]
             write_translation(partial, completed, translations)

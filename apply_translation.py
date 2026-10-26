@@ -20,9 +20,10 @@ from pptx.oxml.xmlchemy import OxmlElement
 from pptx.oxml.ns import qn
 
 from main import clean_text, file_sha256, text_records, walk_shapes
-from translate_texts import read_records
+from translate_texts import TextRecord, changed_numbers, read_records
+from translation_validation import TranslationValidationError, prepare_translation
 from pptx_text import frame_text, equation_map, paragraph_text, math_text_nodes, MC
-from pptx_styles import MARKER, SPAN, plain_text, styled_frame, validate_styles
+from pptx_styles import MARKER, SPAN, plain_text, relaxed_styles, styled_frame, validate_styles
 
 KOREAN = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]")
 LOCATION = re.compile(
@@ -90,8 +91,26 @@ def match_translations(document, translated):
     return matches
 
 
-def replace_segment(nodes, translated, parent, anchor=None, styles=None):
+def replace_segment(nodes, translated, parent, anchor=None, styles=None, fallback=None):
     """Unchanged fragments retain their original run formatting."""
+    if fallback is not None and not MARKER.search(translated):
+        insertion = list(parent).index(nodes[0].getparent()) if nodes else (
+            list(parent).index(anchor) if anchor is not None else len(parent))
+        template = max(nodes, key=lambda node: len(node.text or '')).getparent() if nodes else fallback
+        run = deepcopy(template)
+        run.tag = qn('a:r')
+        run.attrib.clear()
+        for child in list(run):
+            if child.tag != qn('a:rPr'):
+                run.remove(child)
+        for owner in dict.fromkeys(node.getparent() for node in nodes):
+            parent.remove(owner)
+        text = OxmlElement('a:t')
+        text.text = translated
+        text.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        run.append(text)
+        parent.insert(insertion, run)
+        return
     if styles is not None and MARKER.search(translated):
         insertion = list(parent).index(nodes[0].getparent()) if nodes else (
             list(parent).index(anchor) if anchor is not None else len(parent))
@@ -144,7 +163,7 @@ def replace_segment(nodes, translated, parent, anchor=None, styles=None):
                 field.attrib.clear()
 
 
-def replace_paragraph(paragraph, translated, tokens=None, styles=None):
+def replace_paragraph(paragraph, translated, tokens=None, styles=None, fallback=None):
     tokens = tokens or {}
     groups = [[]]
     breaks = []
@@ -167,17 +186,23 @@ def replace_paragraph(paragraph, translated, tokens=None, styles=None):
     if len(groups) != len(lines):
         raise ValueError("문단 내 줄바꿈 매핑이 올바르지 않습니다.")
     for index, (nodes, text) in enumerate(zip(groups, lines)):
-        replace_segment(nodes, text, paragraph, breaks[index] if index < len(breaks) else None, styles)
+        replace_segment(nodes, text, paragraph, breaks[index] if index < len(breaks) else None, styles, fallback)
 
 
-def replace_frame(frame, translated):
+def replace_frame(frame, translated, *, recover=False):
     styles = None
+    fallback = None
+    source, templates = styled_frame(frame)
     if MARKER.search(translated):
-        source, templates = styled_frame(frame)
         if source is None:
             raise ValueError("원본에 없는 서식 표시입니다.")
-        validate_styles(source.replace("\v", "\n").strip("\n"), translated.replace("\v", "\n"))
+        if not recover or not relaxed_styles(source, translated):
+            validate_styles(source.replace("\v", "\n").strip("\n"), translated.replace("\v", "\n"))
         styles = {key: deepcopy(value) for key, value in templates.items()}
+    elif recover and source:
+        # No semantic span mapping is available. Use a consistent source base style,
+        # never assign emphasis by translated character position or reject the prose.
+        fallback = max(templates.values(), key=lambda run: len(''.join(run.itertext())))
     paragraphs = list(frame.paragraphs)
     tokens = equation_map(frame)
     active = [index for index, paragraph in enumerate(paragraphs) if paragraph_text(paragraph._p, tokens).strip()]
@@ -193,7 +218,7 @@ def replace_frame(frame, translated):
     if not changed_paragraphs:
         offset = 0
         for paragraph, count in zip(selected, counts):
-            replace_paragraph(paragraph._p, "\v".join(lines[offset:offset + count]), tokens, styles)
+            replace_paragraph(paragraph._p, "\v".join(lines[offset:offset + count]), tokens, styles, fallback)
             offset += count
     else:
         # A changed paragraph count has no exact style correspondence.
@@ -202,19 +227,12 @@ def replace_frame(frame, translated):
         replacements = []
         for index, line in enumerate(lines):
             template = deepcopy(selected[min(index, len(selected) - 1)]._p)
-            templates = template.xpath("./a:r/a:rPr | ./a:fld/a:rPr")
-            style = deepcopy(templates[0]) if templates else None
+            runs = template.xpath('./a:r | ./a:fld')
+            default_run = deepcopy(runs[0]) if runs else fallback
             for child in list(template):
                 if child.tag in {qn("a:r"), qn("a:fld"), qn("a:br")}:
                     template.remove(child)
-            run = OxmlElement("a:r")
-            if style is not None:
-                run.append(style)
-            text = OxmlElement("a:t")
-            text.text = line
-            run.append(text)
-            end = template.find(qn("a:endParaRPr"))
-            template.insert(list(template).index(end) if end is not None else len(template), run)
+            replace_paragraph(template, line, styles=styles, fallback=default_run)
             replacements.append(template)
         for paragraph in selected:
             body.remove(paragraph._p)
@@ -225,7 +243,7 @@ def replace_frame(frame, translated):
     return changed_paragraphs
 
 
-def sync_text_fallback(shape, expected, translated):
+def sync_text_fallback(shape, expected, translated, *, recover=False):
     """Update equivalent editable fallback text; never alter bitmap fallbacks."""
     choice = next((node for node in shape.element.iterancestors()
                    if node.tag == "{" + MC + "}Choice"), None)
@@ -255,7 +273,7 @@ def sync_text_fallback(shape, expected, translated):
                     nodes[index].text = translated
                     count += 1
             elif clean_text(frame_text(frame)) == expected["text"]:
-                replace_frame(frame, translated)
+                replace_frame(frame, translated, recover=True) if recover else replace_frame(frame, translated)
                 count += 1
     return count
 
@@ -278,7 +296,7 @@ def apply_translation(source, manifest="output/content.json", translations="outp
     destination.parent.mkdir(parents=True, exist_ok=True)
     report = {"source": source.name, "source_sha256": source_hash, "matched": len(matches),
               "replaced": 0, "kept_non_korean": 0, "modified_slides": [], "paragraph_count_changed": [],
-              "fallback_texts_updated": 0, "kept_original": []}
+              "fallback_texts_updated": 0, "kept_original": [], "formatting_deferred": []}
     with TemporaryDirectory(prefix="pptx_translation_", dir=destination.parent) as temporary:
         copied = Path(temporary) / "original.pptx"
         staged = Path(temporary) / "translated.pptx"
@@ -312,13 +330,20 @@ def apply_translation(source, manifest="output/content.json", translations="outp
             if translated == expected['text']:
                 # Preserve the XML verbatim for skipped/failed translations.
                 continue
+            notes = []
+            if recover:
+                record = TextRecord(0, page, '', expected['text'], actual.get('styled_text'))
+                try:
+                    translated, notes = prepare_translation(record, translated)
+                    if changed_numbers(record, translated):
+                        raise TranslationValidationError('numeric_mismatch')
+                except TranslationValidationError as exc:
+                    report['kept_original'].append({'page': page, 'shape_id': shape.shape_id, 'reason': exc.code})
+                    continue
             if (actual.get("styled_text") and translated != expected["text"]
                     and not MARKER.search(translated)):
                 if not recover:
                     raise ValueError("혼합 서식 번역에 의미별 서식 표시가 없습니다. 원본을 다시 추출·번역하세요.")
-                report['kept_original'].append({'page': page, 'shape_id': shape.shape_id,
-                    'reason': '혼합 서식 표시 누락'})
-                continue
             frame = (shape.table.cell(expected["row"] - 1, expected["column"] - 1).text_frame
                      if "row" in expected else shape.text_frame)
             # Replacement can fail after mutating runs. Roll back the entire text body
@@ -335,8 +360,8 @@ def apply_translation(source, manifest="output/content.json", translations="outp
                     node = math_text_nodes(frame)[expected["math_text_index"] - 1]
                     node.text = translated
                 else:
-                    paragraph_changed = replace_frame(frame, translated)
-                fallback_count = sync_text_fallback(shape, expected, translated)
+                    paragraph_changed = replace_frame(frame, translated, recover=True) if recover else replace_frame(frame, translated)
+                fallback_count = sync_text_fallback(shape, expected, translated, recover=recover)
             except ValueError:
                 if not recover:
                     raise
@@ -350,6 +375,10 @@ def apply_translation(source, manifest="output/content.json", translations="outp
                 continue
             if paragraph_changed:
                 report["paragraph_count_changed"].append({"page": page, "shape_id": shape.shape_id})
+            if notes or paragraph_changed:
+                report['formatting_deferred'].append({'page': page, 'shape_id': shape.shape_id,
+                    'row': expected.get('row'), 'column': expected.get('column'),
+                    'reasons': sorted(set(notes + (['paragraph_reflow_deferred'] if paragraph_changed else [])))})
             report["fallback_texts_updated"] += fallback_count
             changed.add(page)
             report["replaced"] += 1
