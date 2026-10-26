@@ -65,6 +65,7 @@ class NodeSettings:
     target_language: str = "English"
     glossary: str = ""
     max_passes: int = 2
+    allow_text_compression: bool = True
 
 
 @dataclass

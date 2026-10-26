@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import subprocess
 from threading import Event, Lock
 import time
 
@@ -12,8 +13,7 @@ from apply_translation import apply_translation
 from pptx_pipeline.stages import AnalysisStage, PipelineContext
 from pptx_pipeline.layout import PPTXLayoutModifier, LayoutPolicy
 from pptx_pipeline.rendering import PowerPointRenderer
-from translate_texts import PPTXTextTranslator, read_records, write_translation
-from gemini_cli import EmptyModelResponseError
+from translate_texts import DEFAULT_BATCH_CHARS, PPTXTextTranslator, make_batches, read_records, write_translation
 from .adapters.codex import CodexConnectionAdapter
 from .adapters.gemini import GeminiConnectionAdapter
 from .adapters.antigravity import AntigravityConnectionAdapter
@@ -63,7 +63,7 @@ class GuardedProvider:
         with self.control.lock: self.control.active = self.underlying
         try:
             if self.instruction:
-                args = (args[0] + '\nAdditional layout instructions (keep all text and formulas unchanged):\n' + self.instruction, *args[1:])
+                args = (args[0] + '\nAdditional layout instructions (preserve meaning, numbers and formulas):\n' + self.instruction, *args[1:])
             result = self.underlying.generate(*args, **kwargs)
             self.model = self.underlying.model
             return result
@@ -145,10 +145,22 @@ class DesktopEngine:
             'adjusted_pages':[],'review_reports':[],'applied':False}
         if state['source_sha256'] != source_hash: raise ValueError('원본이 변경되어 체크포인트를 재사용할 수 없습니다.')
         if state['fingerprint'] != fingerprint: raise ValueError('설정이 변경됐습니다. 재실행으로 새 작업을 시작하세요.')
+        state.setdefault('translation_failures', [])
+        state.setdefault('application_report', {})
         def save_state():
             temp = state_file.with_suffix('.tmp')
             temp.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
-            temp.replace(state_file)
+            # Windows scanners may briefly lock a frequently updated checkpoint.
+            # Keep the previous complete file until the atomic replacement succeeds.
+            for attempt in range(6):
+                try:
+                    temp.replace(state_file)
+                    break
+                except PermissionError:
+                    if attempt == 5:
+                        raise
+                    self.boundary()
+                    time.sleep(.05 * 2 ** attempt)
         context = PipelineContext(job.source, workdir)
         def stage(node, status): self.emit({'type':'node','job':job.id,'node':node,'status':status})
         stage('extract','running')
@@ -162,76 +174,90 @@ class DesktopEngine:
         records = read_records(context.texts)
         translations = {int(k):v for k,v in state['translated'].items()}
         stage('translate','running' if cfg.translate.enabled else 'skipped')
-        for page in range(1,pages + 1):
+        # Extraction already supplies stable IDs and page locations. Network requests
+        # follow document size, while checkpoints/progress retain page-level mapping.
+        pending = [r for r in records if r.id not in translations]
+        batches = list(make_batches(pending, DEFAULT_BATCH_CHARS))
+        page_ids = {page: {r.id for r in records if r.page == page} for page in range(1, pages + 1)}
+        def translation_progress():
+            completed = sum(ids.issubset(translations) for ids in page_ids.values())
+            self.emit({'type':'progress','job':job.id,'node':'translate','page':completed,'pages':pages})
+        translation_progress()
+        for batch in batches:
             self.boundary()
-            batch = [r for r in records if r.page == page and r.id not in translations]
             if batch:
-                def translate_page():
+                def translate_batch():
                     options = self.current_settings.translate
-                    if not options.enabled: return {r.id:r.text for r in batch}
-                    return PPTXTextTranslator(self.provider(options), model=None,
+                    if not options.enabled: return {r.id:r.text for r in batch}, []
+                    translator = PPTXTextTranslator(self.provider(options), model=None,
                         source_language=options.source_language,target_language=options.target_language,
-                        glossary=options.glossary,additional_instructions=options.prompt).translate_batch(batch)
-                try: translated = self.unit(translate_page)
-                except EmptyModelResponseError:
-                    translated = {r.id:r.text for r in batch}
-                    state['translation_failed'].append(page)
-                    self.emit({'type':'warning','message':f'{page}페이지 번역 빈 응답 · 원문 유지'})
+                        glossary=options.glossary,additional_instructions=options.prompt, recover=True)
+                    translated = translator.translate_batch(batch)
+                    return translated, translator.failures
+                translated, failures = self.unit(translate_batch)
+                if failures:
+                    failed_pages = sorted({item['page'] for item in failures})
+                    state['translation_failed'] = sorted(set(state['translation_failed']) | set(failed_pages))
+                    state['translation_failures'].extend(failures)
+                    self.emit({'type':'warning','message':f'{failed_pages}페이지 번역 검증 실패 · {len(failures)}개 항목 원문 유지'})
                 translations.update(translated)
                 state['translated'] = {str(k):v for k,v in translations.items()}
                 save_state()
                 write_translation(workdir / 'translated.partial.txt', [r for r in records if r.id in translations], translations)
-            self.emit({'type':'progress','job':job.id,'node':'translate','page':page,'pages':pages})
+            translation_progress()
         write_translation(context.translations, records, translations)
         stage('translate','done' if cfg.translate.enabled else 'skipped')
         self.boundary()
         if not state['applied']:
             if cfg.translate.enabled:
-                apply_translation(job.source, context.manifest, context.translations, context.translated_pptx)
+                state['application_report'] = apply_translation(job.source, context.manifest,
+                    context.translations, context.translated_pptx, recover=True)
+                for item in state['application_report']['kept_original']:
+                    self.emit({'type':'warning','message':f"{item['page']}페이지 도형 {item['shape_id']} · 적용 검증 실패, 원문 유지"})
             else:
                 shutil.copy2(job.source, context.translated_pptx)
             state['applied'] = True; save_state()
         current = Path(state.get('current_pptx') or context.translated_pptx)
         stage('adjust','running' if cfg.adjust.enabled else 'skipped')
         if cfg.adjust.enabled:
-            for page in range(1,pages + 1):
+            pending_pages = [page for page in range(1, pages + 1) if page not in state['adjusted_pages']]
+            if pending_pages:
                 self.boundary()
-                if page in state['adjusted_pages']: continue
-                destination = workdir / f'reviewed_{page:03d}.pptx'
-                def adjust_page():
+                destination = workdir / 'reviewed_document.pptx'
+                def adjust_document():
                     options = self.current_settings.adjust
                     modifier = PPTXLayoutModifier(self.provider(options,layout=True), PowerPointRenderer(),
-                        policy=LayoutPolicy(max_passes=options.max_passes))
+                        policy=LayoutPolicy(max_passes=options.max_passes,
+                                            allow_text_compression=options.allow_text_compression))
                     return modifier.modify(current, destination, reference=job.source,
-                        manifest=context.manifest, workdir=workdir/f'page_{page:03d}',pages=[page])
-                report = self.unit(adjust_page)
-                current = destination
-                state['current_pptx'] = str(current)
-                state['adjusted_pages'].append(page)
-                state['review_reports'].append({'page':page,'status':report['status'],
-                    'unresolved':report['unresolved'],'report':str(destination.with_suffix('.layout.json'))})
+                        manifest=context.manifest, workdir=workdir/'document-layout', pages=pending_pages,
+                        boundary=self.boundary,
+                        progress=lambda message:self.emit({'type':'warning','message':message}))
+                try:
+                    report = self.unit(adjust_document)
+                except (Stopped, QuotaPause):
+                    raise
+                except (ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                    # Layout is optional. Discard any unverified candidate and retain
+                    # the last published deck; do not swallow disk/permission errors.
+                    for page in pending_pages:
+                        state['review_reports'].append({'page':page,'status':'needs_review',
+                            'unresolved':[{'page':page,'reason':'조정 실패 · 이전 결과 유지',
+                                           'error_type':type(exc).__name__}]})
+                    self.emit({'type':'warning','message':'문서 조정 실패 · 직전 번역 결과 유지 후 저장'})
+                else:
+                    current = destination
+                    state['current_pptx'] = str(current)
+                    compressed = {item['page'] for item in report.get('text_compressions', [])}
+                    for page in pending_pages:
+                        unresolved = [item for item in report['unresolved'] if item['page'] == page]
+                        needs_review = bool(unresolved) or page in compressed or page in report.get('unreviewed_pages', [])
+                        state['review_reports'].append({'page':page,'status':'needs_review' if needs_review else 'verified',
+                            'unresolved':unresolved,'text_compressed':page in compressed,
+                            'report':str(destination.with_suffix('.layout.json'))})
+                state['adjusted_pages'] = sorted(set(state['adjusted_pages']) | set(pending_pages))
                 save_state()
-                # Keep the durable current deck, images and plans; discard duplicate PPTs.
-                page_work=workdir/f'page_{page:03d}'
-                for duplicate in [page_work/'preview.pptx', *page_work.glob('candidate_*.pptx')]:
-                    if duplicate.resolve().parent!=page_work.resolve(): raise ValueError('잘못된 작업 파일 경로')
-                    duplicate.unlink(missing_ok=True)
-                report.pop('preview_pptx',None)
-                destination.with_suffix('.layout.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-                (page_work/'progress.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-                for previous in workdir.glob('reviewed_*.pptx'):
-                    if previous.resolve().parent!=workdir.resolve(): raise ValueError('잘못된 체크포인트 경로')
-                    if previous!=current:
-                        previous_report=previous.with_suffix('.layout.json')
-                        if previous_report.exists():
-                            metadata=json.loads(previous_report.read_text(encoding='utf-8'))
-                            metadata.pop('output',None); metadata['intermediate_output_removed']=True
-                            previous_report.write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
-                            old_progress=Path(metadata['final_layout']).parent/'progress.json'
-                            if workdir.resolve() in old_progress.resolve().parents:
-                                old_progress.write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
-                        previous.unlink()
-                self.emit({'type':'progress','job':job.id,'node':'adjust','page':page,'pages':pages})
+                self.emit({'type':'progress','job':job.id,'node':'adjust','page':pages,'pages':pages})
             stage('adjust','done')
         self.boundary()
         stage('save','running')
@@ -246,9 +272,11 @@ class DesktopEngine:
         except Exception:
             if created: target.unlink(missing_ok=True)
             raise
-        needs_review = bool(state['translation_failed']) or any(r['status']=='needs_review' for r in state['review_reports'])
+        needs_review = (bool(state['translation_failed']) or bool(state['application_report'].get('kept_original'))
+                        or any(r['status']=='needs_review' for r in state['review_reports']))
         result = {'output':str(target),'status':'needs_review' if needs_review else 'done','slides':pages,
             'translation_failed_pages':state['translation_failed'],'review_reports':state['review_reports'],
+            'translation_failures':state['translation_failures'],'application_report':state['application_report'],
             'checkpoint':str(state_file)}
         with target.with_suffix('.report.json').open('x',encoding='utf-8') as output_report:
             json.dump(result,output_report,ensure_ascii=False,indent=2)

@@ -15,6 +15,9 @@ from pptx_styles import MARKER, plain_text, validate_styles
 
 RECORD = re.compile(r"^(\[page=([1-9]\d*)\]\[[^\r\n]*?\])\[(.*)\]$")
 DEFAULT_MODEL = "gemini-3.8-flash-medium"
+# Application batching budget in serialized characters, not a model context limit.
+# Keep ordinary decks together while bounding unusually large requests/outputs.
+DEFAULT_BATCH_CHARS = 60000
 INSTRUCTIONS = """You are a professional English translator of presentation slides.
 Translate every input text into clear, faithful English. Use consistent technical
 terminology across slide pages. Do not summarize, omit, or add information.
@@ -77,19 +80,22 @@ def parse_records(content):
 def make_batches(records, max_chars):
     if max_chars < 1:
         raise ValueError("batch_chars는 1 이상이어야 합니다.")
-    batch, size = [], 0
+    batch, size = [], 2  # JSON array brackets
     for record in records:
-        cost = len(json.dumps({"id": record.id, "page": record.page, "text": record.text}, ensure_ascii=False))
-        if batch and size + cost > max_chars:
+        cost = len(json.dumps({"id": record.id, "page": record.page,
+                               "text": record.styled_text or record.text}, ensure_ascii=False))
+        if batch and size + 2 + cost > max_chars:
             yield batch
-            batch, size = [], 0
+            batch, size = [], 2
+        if batch:
+            size += 2  # JSON item separator
         batch.append(record)
         size += cost
     if batch:
         yield batch
 
 
-def parse_translations(response, records):
+def translation_items(response):
     response = response.strip()
     fence = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n```", response, re.DOTALL | re.IGNORECASE)
     if fence:
@@ -97,9 +103,13 @@ def parse_translations(response, records):
     data = json.loads(response)
     if not isinstance(data, dict) or not isinstance(data.get("translations"), list):
         raise ValueError("번역 결과에 translations 배열이 없습니다.")
+    return data["translations"]
+
+
+def parse_translations(response, records):
     expected = {record.id for record in records}
     translated = {}
-    for item in data["translations"]:
+    for item in translation_items(response):
         if not isinstance(item, dict):
             raise ValueError("번역 항목이 객체가 아닙니다.")
         identifier, text = item.get("id"), item.get("text")
@@ -147,13 +157,16 @@ def write_translation(destination, records, translations):
 
 
 class PPTXTextTranslator:
-    def __init__(self, cli, *, model=DEFAULT_MODEL, batch_chars=8000,
-                 source_language="Korean", target_language="English", glossary="", additional_instructions=""):
+    def __init__(self, cli, *, model=DEFAULT_MODEL, batch_chars=DEFAULT_BATCH_CHARS,
+                 source_language="Korean", target_language="English", glossary="", additional_instructions="",
+                 recover=False):
         if batch_chars < 1:
             raise ValueError("batch_chars는 1 이상이어야 합니다.")
         self.cli = cli
         self.model = model
         self.batch_chars = batch_chars
+        self.recover = recover
+        self.failures = []
         self.instructions = INSTRUCTIONS
         if target_language != "English":
             self.instructions = self.instructions.replace('professional English translator', f'professional {target_language} translator')
@@ -166,6 +179,8 @@ class PPTXTextTranslator:
         if extra: self.instructions = self.instructions.replace('Input records:\n', extra + '\nInput records:\n')
 
     def translate_batch(self, records):
+        if self.recover:
+            return self.translate_recoverable(records)
         payload = [{"id": r.id, "page": r.page, "text": r.styled_text or r.text} for r in records]
         result = self.cli.generate(self.instructions + json.dumps(payload, ensure_ascii=False), model=self.model)
         translated = parse_translations(result.stdout, records)
@@ -178,6 +193,48 @@ class PPTXTextTranslator:
             translated.update(parse_translations(corrected.stdout, incorrect))
             if any(changed_numbers(r, translated[r.id]) or changed_equations(r, translated[r.id]) for r in incorrect):
                 raise ValueError("재번역 후에도 원문 숫자·수식 표시·줄바꿈이 유지되지 않았습니다.")
+        return translated
+
+    def translate_recoverable(self, records):
+        """Retry only invalid records once; never publish unsafe text or raw responses."""
+        translated = {}
+        pending = list(records)
+        for attempt in range(2):
+            if not pending:
+                break
+            payload = [{"id": r.id, "page": r.page, "text": r.styled_text or r.text} for r in pending]
+            prompt = self.instructions + json.dumps(payload, ensure_ascii=False)
+            if attempt:
+                prompt += "\nRetry: preserve every style span, number, equation and structural line break exactly."
+            try:
+                response = self.cli.generate(prompt, model=self.model)
+            except EmptyModelResponseError:
+                items = []
+            else:
+                try:
+                    items = translation_items(response.stdout)
+                except ValueError:
+                    items = []
+            retry = []
+            for record in pending:
+                candidates = [item for item in items if isinstance(item, dict)
+                              and type(item.get('id')) is int and item['id'] == record.id]
+                try:
+                    result = parse_translations(json.dumps({'translations': candidates}), [record])
+                    text = result[record.id]
+                    if changed_numbers(record, text) or changed_equations(record, text):
+                        raise ValueError('숫자·수식 또는 줄바꿈 불일치')
+                except ValueError:
+                    retry.append(record)
+                else:
+                    translated[record.id] = text
+            pending = retry
+        for record in pending:
+            # Plain source text means "keep unchanged" to the applier, including mixed runs.
+            translated[record.id] = record.text
+            self.failures.append({'page': record.page, 'record_id': record.id,
+                                  'reason': '번역 응답 또는 서식·숫자·수식·줄바꿈 검증 실패',
+                                  'action': 'kept_original'})
         return translated
 
     def translate_file(self, source, destination=None, *, progress=None):
@@ -206,7 +263,14 @@ class PPTXTextTranslator:
         save_progress()
         def translate_or_keep(batch, label):
             try:
+                before = len(self.failures)
                 translations.update(self.translate_batch(batch))
+                recovered = self.failures[before:]
+                if recovered:
+                    failures.extend(recovered)
+                    failed_records.update(item['record_id'] for item in recovered)
+                    if progress:
+                        progress(f"번역 검증 실패: {len(recovered)}개 항목 원문 유지 후 계속 진행")
             except EmptyModelResponseError as exc:
                 # Split a failed multi-page request, allowing later pages to succeed.
                 pages = sorted({r.page for r in batch})
@@ -253,7 +317,7 @@ def main(argv=None):
     parser.add_argument("--executable", help="Antigravity CLI 실행 파일 경로")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="사용할 Gemini 모델 slug")
     parser.add_argument("--timeout", type=float, default=300, help="배치별 CLI 제한 시간(초)")
-    parser.add_argument("--batch-chars", type=int, default=8000, help="배치별 입력 크기 목표(문자)")
+    parser.add_argument("--batch-chars", type=int, default=DEFAULT_BATCH_CHARS, help="배치별 서식 포함 JSON 입력 크기 목표(문자, 페이지 경계와 무관)")
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):

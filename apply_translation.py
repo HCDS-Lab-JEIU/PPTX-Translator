@@ -260,7 +260,8 @@ def sync_text_fallback(shape, expected, translated):
     return count
 
 
-def apply_translation(source, manifest="output/content.json", translations="output/translated.txt", destination=None):
+def apply_translation(source, manifest="output/content.json", translations="output/translated.txt", destination=None,
+                      *, recover=False):
     source, manifest, translations = Path(source), Path(manifest), Path(translations)
     destination = Path(destination) if destination else translations.parent / "translated.pptx"
     if source.suffix.lower() != ".pptx" or destination.suffix.lower() != ".pptx":
@@ -277,7 +278,7 @@ def apply_translation(source, manifest="output/content.json", translations="outp
     destination.parent.mkdir(parents=True, exist_ok=True)
     report = {"source": source.name, "source_sha256": source_hash, "matched": len(matches),
               "replaced": 0, "kept_non_korean": 0, "modified_slides": [], "paragraph_count_changed": [],
-              "fallback_texts_updated": 0}
+              "fallback_texts_updated": 0, "kept_original": []}
     with TemporaryDirectory(prefix="pptx_translation_", dir=destination.parent) as temporary:
         copied = Path(temporary) / "original.pptx"
         staged = Path(temporary) / "translated.pptx"
@@ -308,17 +309,48 @@ def apply_translation(source, manifest="output/content.json", translations="outp
                 report["kept_non_korean"] += 1
                 continue
             shape = shapes[(page, expected["shape_id"])]
+            if translated == expected['text']:
+                # Preserve the XML verbatim for skipped/failed translations.
+                continue
             if (actual.get("styled_text") and translated != expected["text"]
                     and not MARKER.search(translated)):
-                raise ValueError("혼합 서식 번역에 의미별 서식 표시가 없습니다. 원본을 다시 추출·번역하세요.")
+                if not recover:
+                    raise ValueError("혼합 서식 번역에 의미별 서식 표시가 없습니다. 원본을 다시 추출·번역하세요.")
+                report['kept_original'].append({'page': page, 'shape_id': shape.shape_id,
+                    'reason': '혼합 서식 표시 누락'})
+                continue
             frame = (shape.table.cell(expected["row"] - 1, expected["column"] - 1).text_frame
                      if "row" in expected else shape.text_frame)
-            if expected["kind"] == "math_text":
-                node = math_text_nodes(frame)[expected["math_text_index"] - 1]
-                node.text = translated
-            elif replace_frame(frame, translated):
+            # Replacement can fail after mutating runs. Roll back the entire text body
+            # and editable fallback before continuing to the next record.
+            roots = [frame._txBody]
+            choice = next((n for n in shape.element.iterancestors()
+                           if n.tag == '{' + MC + '}Choice'), None)
+            if choice is not None:
+                roots.extend(choice.getparent().findall('{' + MC + '}Fallback'))
+            backups = [(root, deepcopy(root)) for root in roots] if recover else []
+            try:
+                paragraph_changed = False
+                if expected["kind"] == "math_text":
+                    node = math_text_nodes(frame)[expected["math_text_index"] - 1]
+                    node.text = translated
+                else:
+                    paragraph_changed = replace_frame(frame, translated)
+                fallback_count = sync_text_fallback(shape, expected, translated)
+            except ValueError:
+                if not recover:
+                    raise
+                for root, backup in backups:
+                    root.attrib.clear()
+                    root.attrib.update(backup.attrib)
+                    root.text, root.tail = backup.text, backup.tail
+                    root[:] = list(backup)
+                report['kept_original'].append({'page': page, 'shape_id': shape.shape_id,
+                    'reason': '서식·수식·줄바꿈 적용 검증 실패'})
+                continue
+            if paragraph_changed:
                 report["paragraph_count_changed"].append({"page": page, "shape_id": shape.shape_id})
-            report["fallback_texts_updated"] += sync_text_fallback(shape, expected, translated)
+            report["fallback_texts_updated"] += fallback_count
             changed.add(page)
             report["replaced"] += 1
         patches = {str(prs.slides[page - 1].part.partname).lstrip("/"):

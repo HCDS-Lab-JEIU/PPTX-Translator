@@ -109,7 +109,7 @@ class PipelineTests(unittest.TestCase):
     def test_entire_pipeline_with_replaceable_ai_and_renderer(self):
         original = self.source.read_bytes()
         provider = FakeProvider()
-        modifier = PPTXLayoutModifier(provider, self.renderer, policy=self.policy)
+        modifier = PPTXLayoutModifier(provider, self.renderer, policy=self.policy, overview=False)
         flow = PresentationPipeline([AnalysisStage(), TranslationStage(provider), ApplicationStage(), ModificationStage(modifier)])
         context = PipelineContext(self.source, self.folder / 'flow')
         result = flow.run(context)
@@ -139,7 +139,7 @@ class PipelineTests(unittest.TestCase):
                     'font_scale': 0.8, 'reason': 'fit'}] if first else []}), tuple(images))
         provider = MultiPageProvider()
         renderer = FakeRenderer()
-        modifier = PPTXLayoutModifier(provider, renderer, policy=self.policy, pages_per_request=2)
+        modifier = PPTXLayoutModifier(provider, renderer, policy=self.policy, pages_per_request=2, overview=False)
         report = modifier.modify(self.source, self.folder / 'selective.pptx', reference=self.source,
                                  manifest=self.manifest, workdir=self.folder / 'selective-work')
         self.assertEqual(provider.image_counts, [4, 2])
@@ -166,7 +166,7 @@ class PipelineTests(unittest.TestCase):
                 return AIResponse(json.dumps({'reviews': [{'page': 2, 'needs_changes': False,
                                                           'issues': []}], 'changes': []}), tuple(images))
         provider = EmptyFirstProvider()
-        report = PPTXLayoutModifier(provider, FakeRenderer()).modify(self.source,
+        report = PPTXLayoutModifier(provider, FakeRenderer(), overview=False, pages_per_request=1).modify(self.source,
             self.folder / 'skip.pptx', reference=self.source, manifest=self.manifest, workdir=work)
         self.assertEqual(provider.calls, 2)
         self.assertEqual(report['status'], 'needs_review')
@@ -180,7 +180,7 @@ class PipelineTests(unittest.TestCase):
             def generate(self, *args, **kwargs):
                 raise GeminiCLIError('PERMISSION_DENIED')
         with self.assertRaises(GeminiCLIError):
-            PPTXLayoutModifier(DeniedProvider(), FakeRenderer()).modify(self.source,
+            PPTXLayoutModifier(DeniedProvider(), FakeRenderer(), overview=False).modify(self.source,
                 self.folder / 'denied.pptx', reference=self.source, manifest=self.manifest,
                 workdir=self.folder / 'denied-work')
 

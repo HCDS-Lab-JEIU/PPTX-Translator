@@ -99,7 +99,10 @@ class Inspector(QScrollArea):
             self.label('조정 목적',True); self.label('텍스트 넘침·그림 겹침·잘림 검토')
             for text in ('원래 의미·수식 유지','기존 글자 크기 우선 유지'):
                 check=QCheckBox(text); check.setChecked(True); check.setEnabled(False); self.box.addWidget(check)
-            self.label('용어·문체 재작성은 현재 미지원입니다. 조정 단계는 텍스트 내용을 바꾸지 않습니다.',True)
+            compress=QCheckBox('필요한 문장만 의미를 유지하며 압축')
+            compress.setChecked(cfg.allow_text_compression)
+            compress.toggled.connect(lambda v:self.set_value('allow_text_compression',v)); self.box.addWidget(compress)
+            self.label('전체 미리보기에서 문제 페이지를 선별합니다. 압축한 문장은 검토 필요로 기록합니다.',True)
             self.label('최대 수정 횟수',True)
             passes=QSpinBox(); passes.setRange(1,5); passes.setValue(cfg.max_passes)
             passes.valueChanged.connect(lambda v:self.set_value('max_passes',v)); self.box.addWidget(passes)

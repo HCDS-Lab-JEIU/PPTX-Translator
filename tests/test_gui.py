@@ -78,7 +78,7 @@ class DesktopDataTests(unittest.TestCase):
         self.assertEqual(engine.current_settings.translate.target_language,'English')
         self.assertEqual(engine.settings.translate.target_language,'Japanese')
 
-    def test_page_checkpoint_resume_and_english_to_korean_application(self):
+    def test_size_split_checkpoint_resume_and_english_to_korean_application(self):
         with TemporaryDirectory() as tmp:
             folder=Path(tmp); source=folder/'source.pptx'
             prs=Presentation()
@@ -100,7 +100,9 @@ class DesktopDataTests(unittest.TestCase):
                     return AIResponse(json.dumps({'translations':[{'id':r['id'],'text':{'Current':'전류','Voltage':'전압'}[r['text']]} for r in data]}))
             provider=Fake(); engine=DesktopEngine(cfg,{},lambda e:None,RunControl())
             engine.provider=lambda node,layout=False:provider
-            with self.assertRaises(Stopped): engine.run_file(job)
+            # Force multiple requests only to exercise interruption between batches.
+            with patch('pptx_gui.engine.DEFAULT_BATCH_CHARS', 1):
+                with self.assertRaises(Stopped): engine.run_file(job)
             checkpoint=json.loads((Path(job.workdir)/'checkpoint.json').read_text(encoding='utf-8'))
             self.assertEqual(len(checkpoint['translated']),1)
             provider.fail=False; result=engine.run_file(job)
@@ -152,6 +154,16 @@ class DesktopWidgetTests(unittest.TestCase):
         self.assertEqual(self.window.settings.translate.model,'demo-agy')
         self.window.select_node('adjust'); self.window.inspector.provider_changed('antigravity')
         self.assertEqual(self.window.settings.adjust.model,'demo-agy')
+    def test_adjustment_compression_can_be_disabled_and_survives_node_switch(self):
+        from PySide6.QtWidgets import QCheckBox
+        self.window.select_node('adjust')
+        checkbox = next(w for w in self.window.inspector.findChildren(QCheckBox)
+                        if w.text() == '필요한 문장만 의미를 유지하며 압축')
+        self.assertTrue(checkbox.isChecked())
+        checkbox.setChecked(False)
+        self.window.select_node('translate')
+        self.window.select_node('adjust')
+        self.assertFalse(self.window.settings.adjust.allow_text_compression)
     def test_account_switch_does_not_reuse_previous_account_quota(self):
         manager=self.window.connections
         manager.states['codex']=Connection('codex',connected=True,account='account A',buckets=[QuotaBucket('A',75)])

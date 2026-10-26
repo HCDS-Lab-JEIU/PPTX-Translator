@@ -7,18 +7,26 @@ $presentation = $null
 $initialCount = 0
 
 function Get-TextMetric($shape, [int]$shapeId, $row = $null, $column = $null) {
+    try {
     if ($shape.HasTextFrame -eq 0 -or $shape.TextFrame2.HasText -eq 0) { return $null }
     $frame = $shape.TextFrame2
     $range = $frame.TextRange
     $width = [double]$shape.Width - [double]$frame.MarginLeft - [double]$frame.MarginRight
     $height = [double]$shape.Height - [double]$frame.MarginTop - [double]$frame.MarginBottom
     $font = [double]$range.Characters(1, 1).Font.Size
+    $lineCount = $null
+    try { $lineCount = [int]$range.Lines().Count } catch { }
     return @{
         shape_id = $shapeId; row = $row; column = $column
         bound_width_pt = [double]$range.BoundWidth; bound_height_pt = [double]$range.BoundHeight
         available_width_pt = $width; available_height_pt = $height
         base_font_pt = $font
+        line_count = $lineCount
         overflow = ([double]$range.BoundHeight -gt ($height + 1.0) -or [double]$range.BoundWidth -gt ($width + 1.0))
+    }
+    } catch {
+        # A shape-specific COM metric failure must not discard rendered slides.
+        return @{ shape_id = $shapeId; row = $row; column = $column; metric_error = $true }
     }
 }
 
