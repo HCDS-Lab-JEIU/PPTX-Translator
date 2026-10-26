@@ -9,6 +9,7 @@ from unittest.mock import Mock
 from lxml import etree
 from pptx import Presentation
 from pptx.util import Cm
+from pptx.oxml.xmlchemy import OxmlElement
 
 from apply_translation import apply_translation, replace_frame
 from main import extract_pptx, file_sha256, format_text
@@ -163,3 +164,54 @@ class TranslationToleranceTests(unittest.TestCase):
             self.assertEqual([s.shapes[0].text for s in Presentation(result['output']).slides], ['Current','Voltage'])
             state = json.loads((work / 'checkpoint.json').read_text(encoding='utf-8'))
             self.assertEqual(state['prior_translation_failures'], old['translation_failures'])
+
+    def test_rebuilt_paragraphs_keep_end_formatting_after_all_text(self):
+        for marked in (False, True):
+            with self.subTest(marked=marked):
+                _, frame = self.frame()
+                frame.add_paragraph()
+                frame.add_paragraph()
+                frame.add_paragraph().text = '전류 설명'
+                for paragraph in frame.paragraphs:
+                    paragraph._p.append(OxmlElement('a:endParaRPr'))
+                text = ('[[STYLE_0]]Increase [[/STYLE_0]][[STYLE_1]]voltage[[/STYLE_1]]\n\n'
+                        '[[STYLE_2]]Current explanation[[/STYLE_2]]') if marked else 'Increase voltage\n\nCurrent explanation'
+                replace_frame(frame, text, recover=True)
+                self.assertEqual(frame.text, 'Increase voltage\n\nCurrent explanation')
+                for paragraph in frame.paragraphs:
+                    self.assertEqual(paragraph._p.xpath('./a:endParaRPr/following-sibling::*'), [])
+
+    def test_old_applied_deck_is_regenerated_from_saved_translation_without_model_calls(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prs = Presentation()
+            for text in ('전류', '전압'):
+                slide = prs.slides.add_slide(prs.slide_layouts[6])
+                slide.shapes.add_textbox(Cm(2), Cm(3), Cm(12), Cm(4)).text = text
+            source = root / 'source.pptx'
+            prs.save(source)
+            work = root / 'work'
+            work.mkdir()
+            old_pptx = work / 'translated.pptx'
+            prs.slides[0].shapes[0].text = ''
+            prs.save(old_pptx)
+            settings = AppSettings()
+            settings.save.directory = str(root / 'results')
+            settings.adjust.enabled = False
+            old_report = {'page':1,'status':'verified','unresolved':[]}
+            state = {'source_sha256':file_sha256(source),
+                'fingerprint':hashlib.sha256(repr(settings).encode()).hexdigest(),
+                'translated':{'0':'Current','1':'Voltage'},'translation_failed':[],
+                'translation_validation_version':2,'applied':True,'current_pptx':str(old_pptx),
+                'adjusted_pages':[1,2],'review_reports':[old_report]}
+            (work / 'checkpoint.json').write_text(json.dumps(state), encoding='utf-8')
+            job = FileJob(source)
+            job.workdir = str(work)
+            engine = DesktopEngine(settings, {}, lambda event: None, RunControl())
+            engine.provider = Mock(side_effect=AssertionError('No paid calls needed to reapply saved text'))
+            result = engine.run_file(job)
+            engine.provider.assert_not_called()
+            self.assertEqual([s.shapes[0].text for s in Presentation(result['output']).slides], ['Current','Voltage'])
+            saved = json.loads((work / 'checkpoint.json').read_text(encoding='utf-8'))
+            self.assertEqual(saved['application_version'], 2)
+            self.assertEqual(saved['prior_review_reports'], [old_report])

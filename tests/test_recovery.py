@@ -125,8 +125,8 @@ class RecoveryTests(unittest.TestCase):
             self.assertTrue(Path(result['output']).with_suffix('.report.json').exists())
             self.assertEqual(sum(e['type'] == 'warning' for e in events), 2)
 
-    def test_engine_does_not_swallow_stop_or_disk_error_during_adjustment(self):
-        for error in (Stopped(), PermissionError('disk unavailable')):
+    def test_engine_does_not_swallow_stop_or_resource_exhaustion_during_adjustment(self):
+        for error in (Stopped(), MemoryError(), RecursionError()):
             with self.subTest(error=type(error).__name__), TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 source = self.make_source(root)
@@ -139,6 +139,30 @@ class RecoveryTests(unittest.TestCase):
                     with self.assertRaises(type(error)):
                         engine.run_file(FileJob(source))
                 self.assertFalse(cfg.save.target(source, cfg.translate.target_language).exists())
+
+    def test_optional_adjustment_exceptions_still_save_the_valid_translation(self):
+        for error in (PermissionError('work file locked'), KeyError('metrics'), AttributeError('missing metric'),
+                      TypeError('invalid plan'), IndexError('missing frame'), StopIteration(), RuntimeError('render')):
+            with self.subTest(error=type(error).__name__), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = self.make_source(root)
+                cfg = AppSettings()
+                cfg.save.directory = str(root / 'results')
+                cfg.translate.enabled = False
+                events = []
+                engine = DesktopEngine(cfg, {}, events.append, RunControl())
+                engine.provider = lambda *args, **kwargs: Mock()
+                def fail_adjustment(*args, **kwargs):
+                    kwargs['progress']('AI 시각 검토 1: 페이지 [1, 2]')
+                    raise error
+                with patch('pptx_gui.engine.PPTXLayoutModifier.modify', side_effect=fail_adjustment):
+                    result = engine.run_file(FileJob(source))
+                self.assertEqual(result['status'], 'needs_review')
+                self.assertEqual(Path(result['output']).read_bytes(), source.read_bytes())
+                self.assertTrue(Path(result['output']).with_suffix('.report.json').is_file())
+                self.assertEqual(result['review_reports'][0]['unresolved'][0]['error_type'], type(error).__name__)
+                self.assertEqual(result['review_reports'][0]['unresolved'][0]['stage'], 'AI 시각 검토 1: 페이지 [1, 2]')
+                self.assertTrue(any(type(error).__name__ in event.get('message', '') for event in events))
 
     def test_checkpoint_retries_transient_lock_but_rejects_persistent_denial(self):
         for persistent in (False, True):

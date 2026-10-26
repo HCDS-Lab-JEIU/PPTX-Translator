@@ -5,7 +5,6 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
-import subprocess
 from threading import Event, Lock
 import time
 
@@ -18,6 +17,7 @@ from translate_texts import DEFAULT_BATCH_CHARS, PPTXTextTranslator, make_batche
 from .adapters.codex import CodexConnectionAdapter
 from .adapters.gemini import GeminiConnectionAdapter
 from .adapters.antigravity import AntigravityConnectionAdapter
+from .adapters.base import safe_error
 
 
 class Stopped(Exception): pass
@@ -240,6 +240,16 @@ class DesktopEngine:
         write_translation(context.translations, records, translations)
         stage('translate','done' if cfg.translate.enabled else 'skipped')
         self.boundary()
+        if state['applied'] and state.get('application_version', 0) < 2:
+            # Older paragraph reconstruction could put text after endParaRPr.
+            # Reapply saved translations from the source without another model call.
+            state['applied'] = False
+            state['application_report'] = {}
+            state.pop('current_pptx', None)
+            state.setdefault('prior_review_reports', []).extend(state['review_reports'])
+            state['review_reports'] = []
+            state['adjusted_pages'] = []
+            save_state()
         if not state['applied']:
             if cfg.translate.enabled:
                 state['application_report'] = apply_translation(job.source, context.manifest,
@@ -248,7 +258,7 @@ class DesktopEngine:
                     self.emit({'type':'warning','message':f"{item['page']}페이지 도형 {item['shape_id']} · 적용 검증 실패, 원문 유지"})
             else:
                 shutil.copy2(job.source, context.translated_pptx)
-            state['applied'] = True; save_state()
+            state['applied'] = True; state['application_version'] = 2; save_state()
         current = Path(state.get('current_pptx') or context.translated_pptx)
         stage('adjust','running' if cfg.adjust.enabled else 'skipped')
         if cfg.adjust.enabled:
@@ -256,6 +266,10 @@ class DesktopEngine:
             if pending_pages:
                 self.boundary()
                 destination = workdir / 'reviewed_document.pptx'
+                adjust_phase = ['조정 준비']
+                def adjustment_progress(message):
+                    adjust_phase[0] = message
+                    self.emit({'type':'warning','message':message})
                 def adjust_document():
                     options = self.current_settings.adjust
                     modifier = PPTXLayoutModifier(self.provider(options,layout=True), PowerPointRenderer(),
@@ -264,19 +278,23 @@ class DesktopEngine:
                     return modifier.modify(current, destination, reference=job.source,
                         manifest=context.manifest, workdir=workdir/'document-layout', pages=pending_pages,
                         boundary=self.boundary,
-                        progress=lambda message:self.emit({'type':'warning','message':message}))
+                        progress=adjustment_progress)
                 try:
                     report = self.unit(adjust_document)
-                except (Stopped, QuotaPause):
+                except (Stopped, QuotaPause, MemoryError, RecursionError):
                     raise
-                except (ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                except Exception as exc:
                     # Layout is optional. Discard any unverified candidate and retain
-                    # the last published deck; do not swallow disk/permission errors.
+                    # the last published deck. Optional adjustment failures (including
+                    # malformed replies/metrics or work-file access) cannot invalidate
+                    # a valid translation. Essential final-save errors still propagate.
+                    detail = safe_error(exc) if isinstance(exc, (ValueError, KeyError, TypeError, AttributeError, IndexError)) else ''
                     for page in pending_pages:
                         state['review_reports'].append({'page':page,'status':'needs_review',
                             'unresolved':[{'page':page,'reason':'조정 실패 · 이전 결과 유지',
-                                           'error_type':type(exc).__name__}]})
-                    self.emit({'type':'warning','message':'문서 조정 실패 · 직전 번역 결과 유지 후 저장'})
+                                           'stage':adjust_phase[0], 'error_type':type(exc).__name__, 'detail':detail}]})
+                    note = f': {detail}' if detail else ''
+                    self.emit({'type':'warning','message':f'문서 조정 실패 [{adjust_phase[0]}] ({type(exc).__name__}){note} · 직전 번역 결과 유지 후 저장'})
                 else:
                     current = destination
                     state['current_pptx'] = str(current)

@@ -91,11 +91,29 @@ def match_translations(document, translated):
     return matches
 
 
+def text_insertion_index(parent, nodes=(), anchor=None):
+    """DrawingML requires endParaRPr after all text, fields, breaks and equations."""
+    end = parent.find(qn('a:endParaRPr'))
+    limit = list(parent).index(end) if end is not None else len(parent)
+    if nodes:
+        return min(list(parent).index(nodes[0].getparent()), limit)
+    if anchor is not None:
+        return min(list(parent).index(anchor), limit)
+    return limit
+
+
+def validate_paragraph_order(frame):
+    for paragraph in frame.paragraphs:
+        children = list(paragraph._p)
+        for index, child in enumerate(children):
+            if child.tag == qn('a:endParaRPr') and index != len(children) - 1:
+                raise ValueError('문단 끝 서식 뒤에 텍스트가 배치되어 표시할 수 없습니다.')
+
+
 def replace_segment(nodes, translated, parent, anchor=None, styles=None, fallback=None):
     """Unchanged fragments retain their original run formatting."""
     if fallback is not None and not MARKER.search(translated):
-        insertion = list(parent).index(nodes[0].getparent()) if nodes else (
-            list(parent).index(anchor) if anchor is not None else len(parent))
+        insertion = text_insertion_index(parent, nodes, anchor)
         template = max(nodes, key=lambda node: len(node.text or '')).getparent() if nodes else fallback
         run = deepcopy(template)
         run.tag = qn('a:r')
@@ -112,8 +130,7 @@ def replace_segment(nodes, translated, parent, anchor=None, styles=None, fallbac
         parent.insert(insertion, run)
         return
     if styles is not None and MARKER.search(translated):
-        insertion = list(parent).index(nodes[0].getparent()) if nodes else (
-            list(parent).index(anchor) if anchor is not None else len(parent))
+        insertion = text_insertion_index(parent, nodes, anchor)
         for run in dict.fromkeys(node.getparent() for node in nodes):
             parent.remove(run)
         matches = list(SPAN.finditer(translated))
@@ -238,6 +255,7 @@ def replace_frame(frame, translated, *, recover=False):
             body.remove(paragraph._p)
         for offset, paragraph in enumerate(replacements):
             body.insert(insertion + offset, paragraph)
+    validate_paragraph_order(frame)
     if clean_text(frame_text(frame)) != clean_text(plain_text(translated)):
         raise ValueError("텍스트 교체 후 내용 검증에 실패했습니다.")
     return changed_paragraphs

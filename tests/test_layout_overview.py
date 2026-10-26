@@ -250,3 +250,20 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(renderer.requested_pages[-1], [5])
         self.assertEqual(report['reviewed_pages'], [5])
         self.assertEqual(report['status'], 'needs_review')
+
+    def test_candidate_render_failure_publishes_previous_safe_deck(self):
+        class BrokenCandidateRenderer(FakeRenderer):
+            def render(inner, source, directory, *, pages=None):
+                if Path(directory).name.startswith('after_'):
+                    raise KeyError('malformed candidate metrics')
+                return super().render(source, directory, pages=pages)
+        provider = self.provider(selected=(2,))
+        renderer = BrokenCandidateRenderer()
+        result = self.root / 'safe-result.pptx'
+        report = PPTXLayoutModifier(provider, renderer, policy=LayoutPolicy(max_passes=1)).modify(
+            self.source, result, reference=self.source, manifest=self.manifest, workdir=self.root / 'safe-work')
+        self.assertEqual(result.read_bytes(), self.source.read_bytes())
+        self.assertEqual(report['status'], 'needs_review')
+        self.assertEqual(report['failures'][-1]['stage'], 'candidate')
+        self.assertEqual(report['failures'][-1]['error_type'], 'KeyError')
+        self.assertNotIn(2, report['reviewed_pages'])

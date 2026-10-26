@@ -514,12 +514,31 @@ class PPTXLayoutModifier:
             if not combined["changes"] or iteration == self.policy.max_passes:
                 break
             candidate = workdir / f"candidate_{iteration + 1:02d}.pptx"
-            apply_layout_changes(current, candidate, combined, snapshots, self.policy, baseline)
-            pending_pages = sorted({change["page"] for change in combined["changes"]})
             boundary()
-            updated = render(candidate, workdir / f"after_{iteration + 1:02d}", pages=pending_pages)
-            if set(updated.images) != set(pending_pages):
-                raise RuntimeError("수정 후 렌더링 페이지가 누락되었습니다.")
+            changed_pages = sorted({change['page'] for change in combined['changes']})
+            candidate_stage = 'apply'
+            try:
+                apply_layout_changes(current, candidate, combined, snapshots, self.policy, baseline)
+                candidate_stage = 'render'
+                updated = render(candidate, workdir / f"after_{iteration + 1:02d}", pages=changed_pages)
+                if set(updated.images) != set(changed_pages):
+                    raise RuntimeError("수정 후 렌더링 페이지가 누락되었습니다.")
+            except (MemoryError, RecursionError):
+                raise
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError, IndexError, StopIteration) as exc:
+                # A candidate is disposable until application and rendering succeed.
+                # Preserve earlier verified passes rather than discarding all work.
+                failures.append({'stage':'candidate','iteration':iteration + 1,
+                                 'operation':candidate_stage, 'pages':changed_pages,'error_type':type(exc).__name__})
+                for page in changed_pages:
+                    latest_reviews[page] = {'page':page,'needs_changes':True,'review_failed':True,
+                        'issues':['조정 사본 적용/렌더링 실패 · 직전 검증본 유지']}
+                final_plan['reviews'] = [latest_reviews[page] for page in pages]
+                if progress:
+                    operation = '적용' if candidate_stage == 'apply' else '렌더링'
+                    progress(f'조정 사본 {operation} 실패 ({type(exc).__name__}) · 직전 검증본을 결과로 저장')
+                break
+            pending_pages = changed_pages
             current_render.images.update(updated.images)
             current_render.slides.update(updated.slides)
             current = candidate
