@@ -22,6 +22,8 @@ GUI 자동 화면 확인은 `python app.py --demo --screenshot output/gui-demo.p
 
 `tests/test_translation_tolerance.py`는 서식 표시 누락·비어 있는 조사 구간·문단 수 변화에서도 번역과 가능한 의미별 서식을 유지하는지 확인합니다. 숫자·수식 보호, native 수식 위치·XML 유지, 적용 보고서 및 이전 체크포인트의 실패 항목만 재시도하는 동작도 검증합니다.
 
+`tests/test_unsupported_shapes.py`는 미지원 `p:contentPart`로 발생하는 `has_ph_elm`/`rot` 오류의 회귀를 검사합니다. 직접 삽입·그룹·AlternateContent 호환 그림 선택과 번역·레이아웃 적용 후 개체 XML 구조 및 관련 ZIP 부품 보존을 확인합니다.
+
 ## 산출물 관리
 
 원본 자료와 사용자 환경 `.venv`, `.vscode`는 임의로 정리하지 않습니다. 실행 결과는 `output/` 또는 사용자가 지정한 폴더에 저장하며 버전 관리에서 제외합니다.

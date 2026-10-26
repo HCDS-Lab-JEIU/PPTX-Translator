@@ -47,17 +47,27 @@ def equation_lines(text):
     return [EQUATION.findall(line) for line in text.replace("\v", "\n").split("\n")]
 
 
-def shape_elements(tree):
+EDITABLE_SHAPE_TAGS = frozenset('{' + P + '}' + name
+                              for name in ('sp', 'grpSp', 'pic', 'graphicFrame', 'cxnSp'))
+
+
+def shape_elements(tree, unsupported=None):
     """Select one supported modern branch, avoiding duplicate Fallback content."""
-    tags = {"{" + P + "}" + name for name in ("sp", "grpSp", "pic", "graphicFrame", "cxnSp", "contentPart")}
     for child in tree:
-        if child.tag in tags:
+        if child.tag in EDITABLE_SHAPE_TAGS:
             yield child
+        elif child.tag == '{' + P + '}contentPart':
+            # python-pptx leaves contentPart as a plain lxml element. Its shape
+            # factories require has_ph_elm/geometry properties that do not exist.
+            # Keep the XML in place; unsupported modern content can have a usable
+            # bitmap/editable fallback in the next AlternateContent branch.
+            if unsupported is not None:
+                unsupported.append(child)
         elif child.tag == "{" + MC + "}AlternateContent":
             choices = child.findall("{" + MC + "}Choice")
             fallbacks = child.findall("{" + MC + "}Fallback")
             for branch in choices + fallbacks:
-                selected = list(shape_elements(branch))
+                selected = list(shape_elements(branch, unsupported))
                 if selected:
                     yield from selected
                     break

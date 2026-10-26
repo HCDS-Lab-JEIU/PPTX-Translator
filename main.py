@@ -62,8 +62,8 @@ def orientation(shape):
     return (a, b, c, d, cx - a * cx - c * cy, cy - b * cx - d * cy)
 
 
-def walk_shapes(shapes, parent=IDENTITY):
-    for element in shape_elements(shapes._spTree):
+def walk_shapes(shapes, parent=IDENTITY, *, unsupported=None):
+    for element in shape_elements(shapes._spTree, unsupported):
         shape = shapes._shape_factory(element)
         matrix = compose(parent, orientation(shape))
         if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
@@ -73,7 +73,7 @@ def walk_shapes(shapes, parent=IDENTITY):
             child = (sx, 0, 0, sy,
                      shape.left - xfrm.chOff.x * sx,
                      shape.top - xfrm.chOff.y * sy)
-            yield from walk_shapes(shape.shapes, compose(matrix, child))
+            yield from walk_shapes(shape.shapes, compose(matrix, child), unsupported=unsupported)
         else:
             yield shape, matrix
 
@@ -217,9 +217,11 @@ def extract_pptx(source, output_dir):
     slides = []
     warnings = []
     omitted_placeholders = 0
+    preserved_unsupported = []
     for page, slide in enumerate(presentation.slides, 1):
         result = {"page": page, "texts": [], "images": []}
-        for z_order, (shape, matrix) in enumerate(walk_shapes(slide.shapes)):
+        unsupported = []
+        for z_order, (shape, matrix) in enumerate(walk_shapes(slide.shapes, unsupported=unsupported)):
             if shape.is_placeholder and shape.placeholder_format.type in NOISE_TYPES:
                 omitted_placeholders += 1
                 continue
@@ -245,6 +247,11 @@ def extract_pptx(source, output_dir):
                 })
             if shape.has_chart:
                 warnings.append(f"페이지 {page}, 도형 {shape.shape_id}: 차트 렌더링은 지원하지 않습니다.")
+        if unsupported:
+            kinds = sorted({element.tag.rsplit('}', 1)[-1] for element in unsupported})
+            warnings.append(f"페이지 {page}: 편집 미지원 삽입 개체 {len(unsupported)}개는 원본 그대로 유지합니다. ({', '.join(kinds)})")
+            preserved_unsupported.extend({'page':page, 'type':element.tag.rsplit('}', 1)[-1]}
+                                         for element in unsupported)
         slides.append(result)
     removed = filter_texts(slides, width, height)
     document = {
@@ -252,7 +259,7 @@ def extract_pptx(source, output_dir):
         "coordinate_unit": "cm",
         "coordinate_origin": "top-left", "slide_size_cm": {"width": width, "height": height},
         "removed_text_count": omitted_placeholders + removed,
-        "slides": slides, "warnings": warnings,
+        "slides": slides, "warnings": warnings, "preserved_unsupported_shapes": preserved_unsupported,
     }
     return document
 

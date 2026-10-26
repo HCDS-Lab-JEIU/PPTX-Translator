@@ -172,6 +172,8 @@ class DesktopEngine:
         context.manifest.write_text(json.dumps(document,ensure_ascii=False,indent=2),encoding='utf-8')
         pages = len(document['slides'])
         self.emit({'type':'analyzed','job':job.id,'pages':pages,'workdir':str(workdir)})
+        for warning in document.get('warnings', []):
+            self.emit({'type':'warning','message':warning})
         stage('extract','done')
         records = read_records(context.texts)
         if state.get('translation_validation_version', 0) < 2:
@@ -303,11 +305,13 @@ class DesktopEngine:
             if created: target.unlink(missing_ok=True)
             raise
         needs_review = (bool(state['translation_failed']) or bool(state['application_report'].get('kept_original'))
+                        or bool(document.get('preserved_unsupported_shapes'))
                         or any(r['status']=='needs_review' for r in state['review_reports']))
         result = {'output':str(target),'status':'needs_review' if needs_review else 'done','slides':pages,
             'translation_failed_pages':state['translation_failed'],'review_reports':state['review_reports'],
             'translation_failures':state['translation_failures'],'translation_deferred':state['translation_deferred'],
             'application_report':state['application_report'],
+            'preserved_unsupported_shapes':document.get('preserved_unsupported_shapes', []),
             'checkpoint':str(state_file)}
         with target.with_suffix('.report.json').open('x',encoding='utf-8') as output_report:
             json.dump(result,output_report,ensure_ascii=False,indent=2)

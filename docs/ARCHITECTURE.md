@@ -49,6 +49,8 @@ GUI 번역은 서식·줄바꿈 문제를 내용 검증 실패로 취급하지 �
 
 위 모듈은 GUI 의존성이므로 Legacy로 취급하지 않습니다. 특히 `main.py`는 GUI 진입점은 아니지만 분석 엔진으로 사용합니다. `gemini_cli.py`의 기존 이름은 공식 Google Gemini CLI를 의미하지 않으며, 공식 Gemini 어댑터는 `pptx_gui/adapters/gemini.py`입니다.
 
+도형 탐색은 python-pptx가 지원하는 일반·그룹·그림·표/차트 프레임·연결선만 래핑합니다. 지원되지 않는 `p:contentPart`는 원본 트리에 남겨 ZIP 패치 시 보존하며, 호환 분기의 편집 가능한 도형·그림이 있으면 해당 분기를 사용합니다. 그룹 내부에도 같은 규칙을 적용합니다. 추출 데이터와 최종 보고서의 `preserved_unsupported_shapes`에 페이지와 종류를 기록하고 GUI는 경고를 표시하며 `needs_review`로 저장합니다. 삽입 개체 자체의 텍스트/OCR 편집을 지원한다는 의미는 아닙니다.
+
 ## Legacy 경계
 
 `legacy/pipeline.py`와 `legacy/copy_pptx.py`는 독립 CLI 도구입니다. Legacy가 활성 공용 코드를 가져오는 것은 허용하지만, GUI·공용 코드는 `legacy`를 가져오지 않습니다. 원본 보존 방식의 번역 적용과 추출 데이터만으로 근사 복원하는 `copy_pptx`는 별개 기능입니다. 테스트는 회귀 검증을 위해 `tests/`에 함께 유지합니다.

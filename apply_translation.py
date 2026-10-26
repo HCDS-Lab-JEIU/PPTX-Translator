@@ -22,7 +22,7 @@ from pptx.oxml.ns import qn
 from main import clean_text, file_sha256, text_records, walk_shapes
 from translate_texts import TextRecord, changed_numbers, read_records
 from translation_validation import TranslationValidationError, prepare_translation
-from pptx_text import frame_text, equation_map, paragraph_text, math_text_nodes, MC
+from pptx_text import EDITABLE_SHAPE_TAGS, frame_text, equation_map, paragraph_text, math_text_nodes, MC
 from pptx_styles import MARKER, SPAN, plain_text, relaxed_styles, styled_frame, validate_styles
 
 KOREAN = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]")
@@ -254,6 +254,8 @@ def sync_text_fallback(shape, expected, translated, *, recover=False):
         ids = [node for node in fallback.iter(qn("p:cNvPr")) if node.get("id") == str(shape.shape_id)]
         for identifier in ids:
             element = identifier.getparent().getparent()
+            if element.tag not in EDITABLE_SHAPE_TAGS:
+                continue
             alternate = shape._parent._shape_factory(element)
             if "row" in expected:
                 if not alternate.has_table:
