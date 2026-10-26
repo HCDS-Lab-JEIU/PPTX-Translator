@@ -21,6 +21,8 @@ from pptx_styles import styled_frame
 from .layout_overview import damage_pages, overview_sheets, metric_candidates, screen_document
 from .layout_text import validate_compression
 from .layout_cache import render_cached
+from .layout_adjustments import (STAGES, STAGE_LABELS, STAGE_FIELDS, STAGE_INSTRUCTIONS,
+    apply_whitespace, eligible_pages, scale_spacing, spacing_profile, validate_whitespace)
 from pptx_text import A, M, MC, frame_text, equation_roots
 from .ai import parse_json_response
 from gemini_cli import EmptyModelResponseError
@@ -34,6 +36,7 @@ class LayoutPolicy:
     max_image_scale: float = 1.10
     max_move_cm: float = 3
     max_passes: int = 2
+    min_spacing_ratio: float = 0.65
     allow_text_compression: bool = False
 
     def __post_init__(self):
@@ -42,7 +45,7 @@ class LayoutPolicy:
             raise ValueError("레이아웃 정책은 유한 숫자이며 적용 횟수는 정수여야 합니다.")
         if type(self.allow_text_compression) is not bool:
             raise ValueError('문장 압축 허용 여부는 bool이어야 합니다.')
-        if not 0 < self.min_font_ratio <= 1 or not 0 < self.min_image_scale <= 1:
+        if not 0 < self.min_font_ratio <= 1 or not 0 < self.min_image_scale <= 1 or not 0 < self.min_spacing_ratio <= 1:
             raise ValueError("최소 배율은 0~1 사이여야 합니다.")
         if self.max_image_scale < 1 or self.min_font_pt <= 0 or self.max_move_cm < 0 or self.max_passes < 1:
             raise ValueError("레이아웃 정책 값이 올바르지 않습니다.")
@@ -104,6 +107,7 @@ def inspect_layout(source, rendered, document, policy, baseline=None):
                     "font_editable": (page, shape.shape_id) in editable and base_font is not None,
                     "base_font_pt": base_font, "min_font_pt": minimum,
                     "metrics": metric, "has_equations": bool(equation_roots(frame))})
+                item['frames'][-1].update(spacing=spacing_profile(frame), has_soft_breaks='\v' in frame_text(frame))
             shapes.append(item)
         result[page] = {"page": page,
             "slide_size_cm": {"width": prs.slide_width / 360000, "height": prs.slide_height / 360000},
@@ -117,11 +121,15 @@ def finite(value, label):
     return float(value)
 
 
-def validate_plan(plan, snapshots, policy, baseline):
+def validate_plan(plan, snapshots, policy, baseline, *, stage=None, verify_only=False):
     if not isinstance(plan, dict) or set(plan) != {"reviews", "changes"}:
         raise ValueError("수정안에는 reviews와 changes만 있어야 합니다.")
     if not isinstance(plan["reviews"], list) or not isinstance(plan["changes"], list):
         raise ValueError("reviews와 changes는 배열이어야 합니다.")
+    if stage is not None and stage not in STAGES:
+        raise ValueError('알 수 없는 조정 단계입니다.')
+    if verify_only and plan['changes']:
+        raise ValueError('재검토 요청에서는 수정안을 적용하지 않습니다. 남은 문제가 있으면 needs_changes=true로 표시하세요.')
     reviews = {}
     for review in plan["reviews"]:
         page = review.get("page")
@@ -134,11 +142,14 @@ def validate_plan(plan, snapshots, policy, baseline):
         raise ValueError("일부 페이지의 시각 검토가 누락되었습니다.")
     seen = set()
     for change in plan["changes"]:
-        allowed = {"page", "shape_id", "row", "column", "font_scale", "box_cm", "reason"}
+        allowed = {"page", "shape_id", "row", "column", "font_scale", "box_cm", "spacing_scale", "whitespace_text", "reason"}
         if policy.allow_text_compression:
             allowed.add('text')
         if not isinstance(change, dict) or set(change) - allowed:
             raise ValueError("허용되지 않은 수정 필드입니다. 텍스트·수식·색상은 수정할 수 없습니다.")
+        actions = set(change) & {'font_scale', 'box_cm', 'spacing_scale', 'whitespace_text', 'text'}
+        if stage and not actions <= STAGE_FIELDS[stage]:
+            raise ValueError(f'{STAGE_LABELS[stage]} 단계에서 허용되지 않는 수정 종류입니다.')
         page, shape_id = change.get("page"), change.get("shape_id")
         if type(page) is not int or type(shape_id) is not int or page not in snapshots:
             raise ValueError("수정 대상 페이지/도형 ID가 올바르지 않습니다.")
@@ -147,6 +158,8 @@ def validate_plan(plan, snapshots, policy, baseline):
         shape = next((s for s in snapshots[page]["shapes"] if s["shape_id"] == shape_id), None)
         if shape is None:
             raise ValueError("수정 대상 도형이 없습니다.")
+        if stage == 'images' and shape['kind'] != 'picture':
+            raise ValueError('그림 단계에서는 그림만 이동·크기 조정할 수 있습니다.')
         key = (page, shape_id, change.get("row"), change.get("column"))
         if key in seen:
             raise ValueError("수정 대상이 중복됩니다.")
@@ -157,8 +170,25 @@ def validate_plan(plan, snapshots, policy, baseline):
             raise ValueError("표 셀은 row와 column을 함께 지정해야 합니다.")
         if change.get("row") is not None and any(type(change[k]) is not int or change[k] < 1 for k in ("row", "column")):
             raise ValueError("표 행·열은 1부터 시작하는 정수여야 합니다.")
-        if not any(key in change for key in ('font_scale', 'box_cm', 'text')):
+        if not actions:
             raise ValueError("수정할 글자 배율 또는 위치·크기가 없습니다.")
+        if 'spacing_scale' in change or 'whitespace_text' in change:
+            frame = next((f for f in shape['frames'] if f['row'] == change.get('row')
+                          and f['column'] == change.get('column')), None)
+            if not frame or not frame['text_editable']:
+                raise ValueError('이 텍스트 프레임의 공백·간격은 수정할 수 없습니다.')
+            if 'whitespace_text' in change:
+                validate_whitespace(frame, change['whitespace_text'])
+            if 'spacing_scale' in change:
+                scale = finite(change['spacing_scale'], 'spacing_scale')
+                if not policy.min_spacing_ratio <= scale <= 1:
+                    raise ValueError('간격 배율이 허용 범위를 벗어났습니다.')
+                original_shape = next(s for s in baseline[page]['shapes'] if s['shape_id'] == shape_id)
+                original_frame = next(f for f in original_shape['frames'] if f['row'] == change.get('row')
+                                      and f['column'] == change.get('column'))
+                for name, initial in original_frame['spacing'].items():
+                    if initial > 0 and name in frame['spacing'] and frame['spacing'][name] * scale < initial * policy.min_spacing_ratio - .01:
+                        raise ValueError('누적 간격 축소가 허용 범위를 벗어났습니다.')
         if 'text' in change:
             frame = next((f for f in shape['frames'] if f['row'] == change.get('row')
                           and f['column'] == change.get('column')), None)
@@ -201,7 +231,8 @@ class LayoutPlanner:
     def __init__(self, provider, policy):
         self.provider, self.policy = provider, policy
 
-    def propose(self, snapshots, baseline, reference_images, current_images, *, previous_error=None):
+    def propose(self, snapshots, baseline, reference_images, current_images, *, previous_error=None,
+                stage=None, verify_only=False):
         images = []
         pairs = []
         for page in snapshots:
@@ -227,7 +258,7 @@ Each review needs_changes reflects the CURRENT image, before the proposed change
 Use an empty changes list if no repair is needed. Never invent a shape ID.
 """
         data = {"images": pairs, "policy": asdict(self.policy), "slides": list(snapshots.values())}
-        if self.policy.allow_text_compression:
+        if self.policy.allow_text_compression and stage in (None, 'compression'):
             prompt = prompt.replace('Keep every word, formula,', 'Preserve all meaning, numbers, formulas,')
             prompt = prompt.replace('Do not rewrite text.',
                 'If new wrapping/overflow cannot be resolved cleanly with geometry, optionally shorten '
@@ -239,6 +270,24 @@ Use an empty changes list if no repair is needed. Never invent a shape ID.
                 'uncompressed_text for meaning preservation as well as the rendered layout.')
             prompt += '\nFor compression, text uses styled_text markers when present, otherwise plain text. '
             prompt += 'A text edit also requires page, shape_id, reason and table row/column if applicable.\n'
+        if stage:
+            fields = ', '.join(sorted(STAGE_FIELDS[stage]))
+            prompt = prompt.replace('Prefer minimal changes: retain existing font sizes and adjust editable box geometry\n'
+                'within limits when possible; shrink only when needed. Preserve image aspect ratio.',
+                'Use only the CURRENT ordered-stage strategy and make the smallest safe repair.')
+            prompt = prompt.replace('Allowed changes: font_scale (relative to CURRENT font), box_cm (absolute slide cm).',
+                                    f'Allowed changes in this stage ONLY: {fields}.')
+            example = {'spacing':'"spacing_scale":0.85',
+                       'images':'"box_cm":{"x":2,"y":3,"width":4,"height":2}',
+                       'compression':'"text":"shorter equivalent expression"'}.get(stage, '"font_scale":0.85')
+            prompt = prompt.replace('"font_scale":0.85', example)
+            prompt += '\nOrdered repair stage: ' + stage + '. ' + STAGE_INSTRUCTIONS[stage]
+            prompt += '\nneeds_changes means ANY remaining material damage, not just what this stage can fix. '
+            prompt += 'If this stage cannot safely solve it, return needs_changes=true with no changes; later stages will try. '
+            prompt += 'Do not change previously resolved areas or make cosmetic edits.\n'
+            if verify_only:
+                prompt += 'READ-ONLY VERIFICATION: return changes=[] and assess the CURRENT rendered result.\n'
+            data.update(stage=stage, verification_only=verify_only)
         for attempt in range(2):
             task = prompt + json.dumps(data, ensure_ascii=False)
             if previous_error:
@@ -247,7 +296,8 @@ Use an empty changes list if no repair is needed. Never invent a shape ID.
             if set(map(Path, response.images_read)) != set(map(Path, images)):
                 raise RuntimeError("AI 이미지 열람이 확인되지 않았습니다.")
             try:
-                return validate_plan(parse_json_response(response.stdout), snapshots, self.policy, baseline)
+                return validate_plan(parse_json_response(response.stdout), snapshots, self.policy, baseline,
+                                     stage=stage, verify_only=verify_only)
             except (ValueError, TypeError, KeyError, AttributeError) as exc:
                 previous_error = str(exc)
                 if attempt:
@@ -286,8 +336,8 @@ def scale_font(frame, scale, base_font_pt):
             props.append(defaults)
 
 
-def apply_layout_changes(source, destination, plan, snapshots, policy, baseline):
-    validate_plan(plan, snapshots, policy, baseline)
+def apply_layout_changes(source, destination, plan, snapshots, policy, baseline, *, stage=None):
+    validate_plan(plan, snapshots, policy, baseline, stage=stage)
     prs = Presentation(str(source))
     signature = text_and_math_signature(prs)
     original_math = signature[1]
@@ -297,6 +347,23 @@ def apply_layout_changes(source, destination, plan, snapshots, policy, baseline)
     for change in plan["changes"]:
         page, shape_id = change["page"], change["shape_id"]
         shape = shapes[(page, shape_id)]
+        if 'whitespace_text' in change:
+            frame = (shape.table.cell(change['row'] - 1, change['column'] - 1).text_frame
+                     if change.get('row') is not None else shape.text_frame)
+            expected = {'kind':'text', 'text':clean_text(frame_text(frame))}
+            if change.get('row') is not None:
+                expected.update(row=change['row'], column=change['column'])
+            apply_whitespace(frame, change['whitespace_text'])
+            sync_text_fallback(shape, expected, change['whitespace_text'], frame_replacer=apply_whitespace)
+            signature = text_and_math_signature(prs)
+            if signature[1] != original_math:
+                raise ValueError('공백 조정이 수식을 변경했습니다.')
+        if 'spacing_scale' in change:
+            info = next(s for s in snapshots[page]['shapes'] if s['shape_id'] == shape_id)
+            frame_info = next(f for f in info['frames'] if f['row'] == change.get('row') and f['column'] == change.get('column'))
+            frame = (shape.table.cell(change['row'] - 1, change['column'] - 1).text_frame
+                     if change.get('row') is not None else shape.text_frame)
+            scale_spacing(frame, change['spacing_scale'], frame_info['base_font_pt'])
         if 'text' in change:
             frame = (shape.table.cell(change['row'] - 1, change['column'] - 1).text_frame
                      if change.get('row') is not None else shape.text_frame)
@@ -357,7 +424,7 @@ def apply_layout_changes(source, destination, plan, snapshots, policy, baseline)
 
 
 class PPTXLayoutModifier:
-    def __init__(self, provider, renderer, *, policy=None, pages_per_request=6, overview=True):
+    def __init__(self, provider, renderer, *, policy=None, pages_per_request=6, overview=True, staged=False):
         if pages_per_request < 1:
             raise ValueError("pages_per_request는 1 이상이어야 합니다.")
         self.provider, self.renderer = provider, renderer
@@ -365,6 +432,7 @@ class PPTXLayoutModifier:
         self.planner = LayoutPlanner(provider, self.policy)
         self.pages_per_request = pages_per_request
         self.overview = overview
+        self.staged = staged
 
     def modify(self, source, destination, *, reference, manifest, workdir=None, pages=None, progress=None,
                boundary=None):
@@ -387,16 +455,28 @@ class PPTXLayoutModifier:
         workdir = Path(workdir or destination.parent / "layout").resolve()
         workdir.mkdir(parents=True, exist_ok=True)
         boundary = boundary or (lambda: None)
+        pdf_planning = self.staged and self.overview
+        screen_pages = all_pages if pdf_planning else pages
+        document_pdf = None
+        if pdf_planning:
+            if progress:
+                progress('조정 1단계 · 전체 슬라이드를 하나의 PDF로 출력')
+            boundary()
+            current_render = render_cached(self.renderer, source, workdir / 'document-pdf', all_pages,
+                                           document=True, boundary=boundary)
+            document_pdf = current_render.pdf
+            boundary()
         if progress:
             progress("원본과 번역본 렌더링")
         render = (lambda path, directory, pages: render_cached(self.renderer, path, directory, pages)) if self.overview else self.renderer.render
-        reference_render = render(reference, workdir / "reference", pages=pages)
+        reference_render = render(reference, workdir / "reference", pages=screen_pages)
         boundary()
-        current_render = render(source, workdir / "before", pages=pages)
+        if not pdf_planning:
+            current_render = render(source, workdir / "before", pages=pages)
         boundary()
         baseline = inspect_layout(source, current_render, document, self.policy)
         (workdir / "before-layout.json").write_text(json.dumps(baseline, ensure_ascii=False, indent=2), encoding="utf-8")
-        if set(current_render.images) != set(pages) or set(reference_render.images) != set(pages):
+        if set(current_render.images) != set(screen_pages) or set(reference_render.images) != set(screen_pages):
             raise RuntimeError("렌더러가 요청한 모든 페이지를 반환하지 않았습니다.")
         current = source
         history = []
@@ -408,12 +488,13 @@ class PPTXLayoutModifier:
         shutil.copy2(source, preview)
         screening = None
         review_key = {'source_sha256': file_sha256(source), 'reference_sha256': file_sha256(reference),
-                      'policy': asdict(self.policy), 'pages': pages, 'review_version': 2}
+                      'policy': asdict(self.policy), 'pages': pages, 'review_version': 2,
+                      'repair_mode':'pdf-predicted-v1' if pdf_planning else 'staged-v1' if self.staged else 'mixed'}
         if self.overview:
             if progress:
-                progress('전체 슬라이드 미리보기 일괄 검토')
-            sheets = overview_sheets(reference_render.images, current_render.images, pages, workdir / 'overview')
-            candidates = metric_candidates(reference_render, current_render, pages)
+                progress('조정 2단계 · 전체 PDF 읽기 및 페이지별 필요 조정 예측' if pdf_planning else '전체 슬라이드 미리보기 일괄 검토')
+            sheets = overview_sheets(reference_render.images, current_render.images, screen_pages, workdir / 'overview')
+            candidates = metric_candidates(reference_render, current_render, screen_pages)
             try:
                 screen_file = workdir / 'screening.json'
                 saved_screen = json.loads(screen_file.read_text(encoding='utf-8')) if screen_file.exists() else {}
@@ -423,20 +504,24 @@ class PPTXLayoutModifier:
                     reviews = validate_plan({'reviews': saved_screen['reviews'], 'changes': []}, baseline,
                                             self.policy, baseline)['reviews']
                 else:
-                    reviews = screen_document(self.provider, sheets, pages, candidates)
-                latest_reviews = {r['page']: r for r in reviews}
-                pending_pages = [r['page'] for r in reviews if r['needs_changes']]
+                    reviews = screen_document(self.provider, sheets, screen_pages, candidates, pdf=document_pdf)
+                latest_reviews = {r['page']: r for r in reviews if r['page'] in pages}
+                pending_pages = [r['page'] for r in reviews if r['needs_changes'] and r['page'] in pages]
                 screening = {'reviews': reviews, 'selected_pages': pending_pages,
                              'contact_sheets': [str(path) for path in sheets], 'metric_candidates': candidates,
-                             'key': review_key}
+                             'key': review_key, 'pdf':str(document_pdf) if document_pdf else None,
+                             'input_format':'pdf_rasterized' if pdf_planning else 'slide_images'}
             except (ValueError, RuntimeError) as exc:
                 # Screening failure must neither label the deck verified nor force
                 # every slide through expensive repair without evidence of damage.
-                pending_pages = damage_pages(candidates)
+                pending_pages = [p for p in damage_pages(candidates) if p in pages]
                 latest_reviews = {page: {'page': page, 'needs_changes': page in pending_pages,
-                    'review_failed': True, 'issues': ['전체 선별 검토 실패 · 자동 수정 보류']} for page in pages}
+                    'review_failed': True, 'issues': ['전체 선별 검토 실패 · 자동 수정 보류'],
+                    **({'predicted_adjustments':['font','spacing'] if page in pending_pages else []} if pdf_planning else {})}
+                    for page in pages}
                 screening = {'selected_pages': pending_pages, 'failed': True, 'error_type': type(exc).__name__,
-                             'unverified_pages': pages, 'metric_candidates': candidates}
+                             'unverified_pages': pages, 'metric_candidates': candidates,
+                             'pdf':str(document_pdf) if document_pdf else None}
                 failures.append({'stage': 'overview', 'pages': pages, 'error_type': type(exc).__name__})
             (workdir / 'screening.json').write_text(json.dumps(screening, ensure_ascii=False, indent=2), encoding='utf-8')
             boundary()
@@ -444,12 +529,51 @@ class PPTXLayoutModifier:
                 final_plan = {'reviews': list(latest_reviews.values()), 'changes': []}
                 snapshots = baseline
         compressions = []
+        whitespace_changes = []
+        pipeline_stages = []
+        predicted_reviews = screening.get('reviews', list(latest_reviews.values())) if screening else list(latest_reviews.values())
+        predictions = {review['page']:review.get('predicted_adjustments', []) for review in predicted_reviews}
+        if pdf_planning and progress:
+            for page in pending_pages:
+                labels = ' → '.join(STAGE_LABELS[s] for s in predictions[page])
+                progress(f'{page}페이지 조정 예측 · {labels}')
+            progress(f'조정 3단계 · 페이지별 조정 시작 · 후보 {len(pending_pages)}페이지')
+        stage_order = [stage for stage in STAGES if stage != 'compression' or self.policy.allow_text_compression] if self.staged else [None]
+        for page in pages:
+            latest_reviews.setdefault(page, {'page':page,'needs_changes':page in pending_pages,
+                                             'review_failed':True,'issues':['미검토']})
+        if final_plan is None:
+            final_plan = {'reviews':list(latest_reviews.values()), 'changes':[]}
+            snapshots = baseline
+        previous_stage = object()
+        skip_stage = False
+        stage_summary = None
         (workdir / "progress.json").write_text(json.dumps({"status": "running",
             "requested_pages": pages, "pending_pages": pages, "reviews": [],
             "preview_pptx": str(preview), "current_pptx": str(source.resolve())},
             ensure_ascii=False, indent=2), encoding="utf-8")
         # Last iteration is read-only verification, so applied edits are always re-rendered.
-        for iteration in range(self.policy.max_passes + 1):
+        for stage, iteration in ((stage, iteration) for stage in stage_order for iteration in range(self.policy.max_passes + 1)):
+            if stage != previous_stage:
+                previous_stage = stage
+                skip_stage = False
+                if self.staged:
+                    remaining = [page for page in pages if latest_reviews[page]['needs_changes']]
+                    if not remaining:
+                        break
+                    snapshots = inspect_layout(current, current_render, document, self.policy, baseline)
+                    routed = [p for p in remaining if stage in predictions.get(p, [])] if pdf_planning else remaining
+                    pending_pages = eligible_pages(stage, snapshots, routed)
+                    stage_summary = {'stage':stage,'label':STAGE_LABELS[stage], 'input_pages':remaining,
+                        'attempted_pages':list(pending_pages), 'skipped_pages':sorted(set(remaining) - set(pending_pages)),
+                        'resolved_pages':[], 'remaining_pages':list(remaining), 'passes':[]}
+                    pipeline_stages.append(stage_summary)
+                    if progress:
+                        progress(f'세부 조정 {stage_order.index(stage) + 1}/{len(stage_order)} · {STAGE_LABELS[stage]} · 후보 {len(pending_pages)}페이지')
+                    if not pending_pages:
+                        skip_stage = True
+            if skip_stage:
+                continue
             if not pending_pages:
                 break
             boundary()
@@ -459,22 +583,30 @@ class PPTXLayoutModifier:
                 selected = pending_pages[start:start + self.pages_per_request]
                 boundary()
                 if progress:
-                    progress(f"AI 시각 검토 {iteration + 1}: 페이지 {selected}")
-                request_file = workdir / f"review_{iteration + 1:02d}_{selected[0]:03d}.json"
-                request_key = {**review_key, 'current_sha256': file_sha256(current), 'selected': selected}
+                    label = STAGE_LABELS[stage] + ' · ' if stage else ''
+                    progress(f"{label}AI 시각 검토 {iteration + 1}: 페이지 {selected}")
+                prefix = stage + '_' if stage else ''
+                verify_only = bool(stage and iteration == self.policy.max_passes)
+                request_file = workdir / f"review_{prefix}{iteration + 1:02d}_{selected[0]:03d}.json"
+                request_key = {**review_key, 'current_sha256': file_sha256(current), 'selected': selected,
+                               'stage':stage, 'verification_only':verify_only}
                 try:
-                    selected_snapshots = {page: snapshots[page] for page in selected}
+                    selected_snapshots = {page: {**snapshots[page],
+                        **({'predicted_adjustments':predictions.get(page, [])} if pdf_planning else {})}
+                        for page in selected}
                     saved = json.loads(request_file.read_text(encoding='utf-8')) if self.overview and request_file.exists() else {}
                     if not isinstance(saved, dict):
                         saved = {}
                     if saved.get('key') == request_key:
-                        plan = validate_plan(saved['plan'], selected_snapshots, self.policy, baseline)
+                        plan = validate_plan(saved['plan'], selected_snapshots, self.policy, baseline,
+                                             stage=stage, verify_only=verify_only)
                     else:
                         plan = self.planner.propose(selected_snapshots, baseline,
-                                                    reference_render.images, current_render.images)
+                                                    reference_render.images, current_render.images,
+                                                    stage=stage, verify_only=verify_only)
                 except (EmptyModelResponseError, ValueError, KeyError, TypeError) as exc:
                     # Do not treat a missing review as a successful visual check.
-                    failure = {"iteration": iteration + 1, "pages": selected, "error_type": type(exc).__name__}
+                    failure = {"iteration": iteration + 1, "pages": selected, "error_type": type(exc).__name__, 'stage':stage}
                     failures.append(failure)
                     plan = {"reviews": [{"page": page, "needs_changes": True,
                         "review_failed": True, "issues": ['검토 응답 없음 또는 수정안 검증 실패']} for page in selected], "changes": []}
@@ -494,10 +626,11 @@ class PPTXLayoutModifier:
                     # Save one candidate per pass, not a full PPT for every AI batch.
                     if not self.overview:
                         apply_layout_changes(current, preview, combined,
-                            {p: snapshots[p] for p in checked}, self.policy, baseline)
+                            {p: snapshots[p] for p in checked}, self.policy, baseline, stage=stage)
                 else:
                     shutil.copy2(current, preview)
                 checkpoint = {"status": "running", "iteration": iteration + 1,
+                    'stage':stage, 'pipeline_stages':pipeline_stages,
                     "current_pptx": str(current.resolve()), "preview_pptx": str(preview), "requested_pages": pages,
                     "pending_pages": pending_pages[start + len(selected):],
                     "reviews": list({**latest_reviews, **{r["page"]: r for r in combined["reviews"]}}.values()),
@@ -505,22 +638,35 @@ class PPTXLayoutModifier:
                     "final_images": {str(p): str(path) for p, path in current_render.images.items()}}
                 (workdir / "progress.json").write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2), encoding="utf-8")
             latest_reviews.update({review["page"]: review for review in combined["reviews"]})
+            if stage_summary is not None:
+                stage_summary['resolved_pages'] = [p for p in stage_summary['input_pages']
+                    if not latest_reviews[p]['needs_changes'] and not latest_reviews[p].get('review_failed')]
+                stage_summary['remaining_pages'] = [p for p in stage_summary['input_pages']
+                    if latest_reviews[p]['needs_changes'] or latest_reviews[p].get('review_failed')]
+                stage_summary['passes'].append({'iteration':iteration + 1, 'verification_only':verify_only,
+                                               'reviewed_pages':list(pending_pages), 'changes':len(combined['changes'])})
+                if progress:
+                    progress(f"{STAGE_LABELS[stage]} 검토 결과 · 해결 {len(stage_summary['resolved_pages'])}페이지 · 남음 {len(stage_summary['remaining_pages'])}페이지")
             combined["reviews"] = [latest_reviews[page] for page in pages]
-            plan_file = workdir / f"plan_{iteration + 1:02d}.json"
+            plan_file = workdir / f"plan_{prefix}{iteration + 1:02d}.json"
             plan_file.write_text(json.dumps(combined, ensure_ascii=False, indent=2), encoding="utf-8")
             history.append({"plan": str(plan_file), "changes": len(combined["changes"]),
-                            "reviewed_pages": pending_pages})
+                            "reviewed_pages": pending_pages, 'stage':stage})
             final_plan = combined
             if not combined["changes"] or iteration == self.policy.max_passes:
+                if self.staged:
+                    skip_stage = True
+                    continue
                 break
-            candidate = workdir / f"candidate_{iteration + 1:02d}.pptx"
+            candidate = workdir / f"candidate_{prefix}{iteration + 1:02d}.pptx"
             boundary()
             changed_pages = sorted({change['page'] for change in combined['changes']})
             candidate_stage = 'apply'
             try:
-                apply_layout_changes(current, candidate, combined, snapshots, self.policy, baseline)
+                apply_layout_changes(current, candidate, combined, {p:snapshots[p] for p in pages},
+                                     self.policy, baseline, stage=stage)
                 candidate_stage = 'render'
-                updated = render(candidate, workdir / f"after_{iteration + 1:02d}", pages=changed_pages)
+                updated = render(candidate, workdir / f"after_{prefix}{iteration + 1:02d}", pages=changed_pages)
                 if set(updated.images) != set(changed_pages):
                     raise RuntimeError("수정 후 렌더링 페이지가 누락되었습니다.")
             except (MemoryError, RecursionError):
@@ -529,11 +675,13 @@ class PPTXLayoutModifier:
                 # A candidate is disposable until application and rendering succeed.
                 # Preserve earlier verified passes rather than discarding all work.
                 failures.append({'stage':'candidate','iteration':iteration + 1,
-                                 'operation':candidate_stage, 'pages':changed_pages,'error_type':type(exc).__name__})
+                                 'strategy':stage, 'operation':candidate_stage, 'pages':changed_pages,'error_type':type(exc).__name__})
                 for page in changed_pages:
                     latest_reviews[page] = {'page':page,'needs_changes':True,'review_failed':True,
                         'issues':['조정 사본 적용/렌더링 실패 · 직전 검증본 유지']}
                 final_plan['reviews'] = [latest_reviews[page] for page in pages]
+                if stage_summary is not None:
+                    stage_summary['remaining_pages'] = [p for p in stage_summary['input_pages'] if latest_reviews[p]['needs_changes']]
                 if progress:
                     operation = '적용' if candidate_stage == 'apply' else '렌더링'
                     progress(f'조정 사본 {operation} 실패 ({type(exc).__name__}) · 직전 검증본을 결과로 저장')
@@ -543,6 +691,8 @@ class PPTXLayoutModifier:
             current_render.slides.update(updated.slides)
             current = candidate
             for change in combined['changes']:
+                if 'whitespace_text' in change or 'spacing_scale' in change:
+                    whitespace_changes.append(dict(change))
                 if 'text' in change:
                     original_frame = next(f for shape in baseline[change['page']]['shapes']
                         if shape['shape_id'] == change['shape_id'] for f in shape['frames']
@@ -563,6 +713,9 @@ class PPTXLayoutModifier:
                   "unreviewed_pages": sorted(set(all_pages) - set(reviewed_pages)),
                   "failures": failures,
                   "screening": screening, "text_compressions": compressions,
+                  'pipeline_stages':pipeline_stages, 'stage_order':stage_order if self.staged else [],
+                  'page_predictions':predictions if pdf_planning else {},
+                  'whitespace_changes':whitespace_changes,
                   "preview_pptx": str(preview),
                   "status": "needs_review" if unresolved or compressions or len(reviewed_pages) != len(pages) else "verified",
                   "unresolved": unresolved, "history": history,

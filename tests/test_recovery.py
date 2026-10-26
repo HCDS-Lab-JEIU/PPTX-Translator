@@ -142,7 +142,8 @@ class RecoveryTests(unittest.TestCase):
 
     def test_optional_adjustment_exceptions_still_save_the_valid_translation(self):
         for error in (PermissionError('work file locked'), KeyError('metrics'), AttributeError('missing metric'),
-                      TypeError('invalid plan'), IndexError('missing frame'), StopIteration(), RuntimeError('render')):
+                      TypeError('invalid plan'), IndexError('missing frame'), StopIteration(), RuntimeError('render'),
+                      ModuleNotFoundError("No module named 'pypdfium2'", name='pypdfium2')):
             with self.subTest(error=type(error).__name__), TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 source = self.make_source(root)
@@ -163,6 +164,9 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(result['review_reports'][0]['unresolved'][0]['error_type'], type(error).__name__)
                 self.assertEqual(result['review_reports'][0]['unresolved'][0]['stage'], 'AI 시각 검토 1: 페이지 [1, 2]')
                 self.assertTrue(any(type(error).__name__ in event.get('message', '') for event in events))
+                if isinstance(error, ModuleNotFoundError):
+                    self.assertIn('pypdfium2', result['review_reports'][0]['unresolved'][0]['detail'])
+                    self.assertTrue(any('pypdfium2' in event.get('message', '') for event in events))
 
     def test_checkpoint_retries_transient_lock_but_rejects_persistent_denial(self):
         for persistent in (False, True):

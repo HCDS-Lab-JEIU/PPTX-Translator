@@ -55,6 +55,22 @@ class FakeRenderer:
             slides[page] = {'page': page, 'text_metrics': metrics}
         return RenderResult(images, slides)
 
+    def render_document(self, source, directory, *, boundary=None):
+        from PIL import Image
+        from pptx_pipeline.layout_pdf import pdf_page_images
+        pages = list(range(1, len(Presentation(source).slides) + 1))
+        result = self.render(source, directory, pages=pages)
+        pdf = Path(directory) / 'slides.pdf'
+        frames = [Image.new('RGB', (400,225), (255,255,255)) for _ in pages]
+        try:
+            frames[0].save(pdf, 'PDF', save_all=True, append_images=frames[1:])
+        finally:
+            for frame in frames:
+                frame.close()
+        images = pdf_page_images(pdf, Path(directory) / 'pdf-pages', expected_pages=len(pages),
+                                 width=400, boundary=boundary)
+        return RenderResult(images, result.slides, pdf)
+
 
 class FakeProvider:
     model = 'test-model'

@@ -16,6 +16,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File packaging/windows/build.ps1 
 
 `.build-venv/`에 별도 환경을 만들고 의존성을 설치합니다. 기존 개발용 `.venv`나 전역 환경을 수정하지 않습니다. 처음에는 패키지 다운로드가 필요합니다.
 
+`-SkipInstall`을 사용해도 PDF 모듈(`pypdfium2`, `pypdfium2_raw`)과 네이티브 렌더링을 빌드 전에 검사합니다. 누락되면 설치를 생략하지 않고 다시 실행하세요. spec에는 PDF 모듈을 명시적으로 포함합니다. 소스 실행 환경은 별도이므로 `python -m pip install -r requirements-gui.txt`도 해당 Python으로 실행해야 합니다.
+
 ## 배포
 
 - `dist/PPTTranslator/PPTTranslator.exe`: GUI 실행 파일

@@ -99,7 +99,7 @@ class SaveSettings:
 @dataclass
 class AppSettings:
     translate: NodeSettings = field(default_factory=lambda: NodeSettings(effort="medium"))
-    adjust: NodeSettings = field(default_factory=lambda: NodeSettings(effort="low"))
+    adjust: NodeSettings = field(default_factory=lambda: NodeSettings(effort="low", max_passes=1))
     save: SaveSettings = field(default_factory=SaveSettings)
 
 

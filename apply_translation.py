@@ -261,7 +261,7 @@ def replace_frame(frame, translated, *, recover=False):
     return changed_paragraphs
 
 
-def sync_text_fallback(shape, expected, translated, *, recover=False):
+def sync_text_fallback(shape, expected, translated, *, recover=False, frame_replacer=None):
     """Update equivalent editable fallback text; never alter bitmap fallbacks."""
     choice = next((node for node in shape.element.iterancestors()
                    if node.tag == "{" + MC + "}Choice"), None)
@@ -293,7 +293,10 @@ def sync_text_fallback(shape, expected, translated, *, recover=False):
                     nodes[index].text = translated
                     count += 1
             elif clean_text(frame_text(frame)) == expected["text"]:
-                replace_frame(frame, translated, recover=True) if recover else replace_frame(frame, translated)
+                if frame_replacer is not None:
+                    frame_replacer(frame, translated)
+                else:
+                    replace_frame(frame, translated, recover=True) if recover else replace_frame(frame, translated)
                 count += 1
     return count
 

@@ -55,13 +55,25 @@ try {
     $application = New-Object -ComObject PowerPoint.Application
     $initialCount = $application.Presentations.Count
     $presentation = $application.Presentations.Open($job.source, -1, 0, 0)
+    if ($job.document_pdf) {
+        # Work only in this read-only in-memory presentation. Include hidden slides
+        # so PDF page N always corresponds to slide N. SaveAs PDF avoids COM
+        # ExportAsFixedFormat's PrintRange binding differences across Office versions.
+        for ($page = 1; $page -le $presentation.Slides.Count; $page++) {
+            $presentation.Slides.Item($page).SlideShowTransition.Hidden = 0
+        }
+        $presentation.SaveAs((Join-Path $job.output 'slides.pdf'), 32)
+        $presentation.Saved = -1
+    }
     $height = [int][Math]::Round($job.width * $presentation.PageSetup.SlideHeight / $presentation.PageSetup.SlideWidth)
     $slides = [System.Collections.Generic.List[object]]::new()
     for ($page = 1; $page -le $presentation.Slides.Count; $page++) {
         if ($job.pages.Count -gt 0 -and $job.pages -notcontains $page) { continue }
         $slide = $presentation.Slides.Item($page)
         $filename = 'slide_{0:D3}.png' -f $page
-        $slide.Export((Join-Path $job.output $filename), 'PNG', [int]$job.width, $height)
+        if (-not $job.document_pdf) {
+            $slide.Export((Join-Path $job.output $filename), 'PNG', [int]$job.width, $height)
+        }
         $slides.Add(@{ page = $page; image = $filename; text_metrics = @(Get-ShapeMetrics $slide.Shapes) })
     }
     @{ slides = $slides.ToArray() } | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath (Join-Path $job.output 'render.json') -Encoding UTF8

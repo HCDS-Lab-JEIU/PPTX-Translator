@@ -26,6 +26,10 @@ GUI 자동 화면 확인은 `python app.py --demo --screenshot output/gui-demo.p
 
 `tests/test_unsupported_shapes.py`는 미지원 `p:contentPart`로 발생하는 `has_ph_elm`/`rot` 오류의 회귀를 검사합니다. 직접 삽입·그룹·AlternateContent 호환 그림 선택과 번역·레이아웃 적용 후 개체 XML 구조 및 관련 ZIP 부품 보존을 확인합니다.
 
+`tests/test_layout_stages.py`는 폰트→공백·간격→그림→문장 간소화 순서, 렌더링 후 검토된 해결 페이지의 후보 제거, 단계 경계에서 금지된 작업 차단, 검토 실패 페이지 유지, 축약 비활성화, 단계별 캐시 재개를 검증합니다. 공백 수정 시 숫자·단어 구분·코드 보호와 빈 문단 제거 후 강조·목록 속성 보존도 검사합니다. 모델 응답은 모의 데이터이며 유료 호출은 하지 않습니다.
+
+`tests/test_pdf_planning.py`는 전체 PDF가 상세 조정보다 먼저 존재하는지, 모든 PDF 페이지의 예측·복수 조정 종류·불필요 단계 생략·일부 페이지만 변경하는 실행에서도 전체 PDF 검토·예측 누락 시 무분별한 조정 방지·페이지 수 불일치·PDF 삭제 후 캐시 복구를 확인합니다. PDFium은 동시 호출을 잠금으로 제한하며 외부 Poppler 설치 없이 앱에서 PDF 페이지를 읽습니다. 실제 PowerPoint의 PDF 출력은 별도 통합 검증이 필요합니다.
+
 ## 산출물 관리
 
 원본 자료와 사용자 환경 `.venv`, `.vscode`는 임의로 정리하지 않습니다. 실행 결과는 `output/` 또는 사용자가 지정한 폴더에 저장하며 버전 관리에서 제외합니다.

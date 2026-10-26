@@ -1,1 +1,2 @@
 python-pptx>=1.0.2,<2
+pypdfium2>=5,<6

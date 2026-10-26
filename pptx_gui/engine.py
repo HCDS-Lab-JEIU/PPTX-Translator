@@ -274,7 +274,7 @@ class DesktopEngine:
                     options = self.current_settings.adjust
                     modifier = PPTXLayoutModifier(self.provider(options,layout=True), PowerPointRenderer(),
                         policy=LayoutPolicy(max_passes=options.max_passes,
-                                            allow_text_compression=options.allow_text_compression))
+                                            allow_text_compression=options.allow_text_compression), staged=True)
                     return modifier.modify(current, destination, reference=job.source,
                         manifest=context.manifest, workdir=workdir/'document-layout', pages=pending_pages,
                         boundary=self.boundary,
@@ -288,7 +288,10 @@ class DesktopEngine:
                     # the last published deck. Optional adjustment failures (including
                     # malformed replies/metrics or work-file access) cannot invalidate
                     # a valid translation. Essential final-save errors still propagate.
-                    detail = safe_error(exc) if isinstance(exc, (ValueError, KeyError, TypeError, AttributeError, IndexError)) else ''
+                    if isinstance(exc, ModuleNotFoundError):
+                        detail = f'필요 모듈 누락: {safe_error(exc.name or "알 수 없음")} · 실행 환경의 의존성 설치 또는 배포본 갱신 필요'
+                    else:
+                        detail = safe_error(exc) if isinstance(exc, (ValueError, KeyError, TypeError, AttributeError, IndexError)) else ''
                     for page in pending_pages:
                         state['review_reports'].append({'page':page,'status':'needs_review',
                             'unresolved':[{'page':page,'reason':'조정 실패 · 이전 결과 유지',

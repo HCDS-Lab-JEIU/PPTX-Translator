@@ -24,6 +24,8 @@ try {
     if (-not $SkipInstall) {
         Invoke-Checked -Executable $buildPython -Arguments @('-m', 'pip', 'install', '-r', (Join-Path $buildRoot 'requirements-build.txt'))
     }
+    # A skipped install must not silently produce a build missing PDF support.
+    Invoke-Checked -Executable $buildPython -Arguments @((Join-Path $buildRoot 'check_dependencies.py'))
     $env:PPT_TRANSLATOR_BUILD_CONSOLE = if ($Console) { '1' } else { '0' }
     Invoke-Checked -Executable $buildPython -Arguments @(
         '-m', 'PyInstaller', '--noconfirm', '--clean',
