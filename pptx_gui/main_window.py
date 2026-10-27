@@ -12,6 +12,7 @@ from .widgets.pipeline_panel import PipelinePanel
 from .widgets.inspector import Inspector
 from .widgets.progress_panel import ProgressPanel
 from .widgets.connections_dialog import ConnectionsDialog
+from .review_summary import review_pages, review_message
 
 
 class MainWindow(QMainWindow):
@@ -203,7 +204,10 @@ class MainWindow(QMainWindow):
             self.progress.current.setText(f'{job.source.name} · {NODES[event["node"]][0]} · {event["page"]}/{event["pages"]}페이지 처리')
         elif kind=='file_done':
             job.status=event['result']['status']; job.output=event['result']['output']; job.slides=event['result']['slides']
+            job.review_required_pages=review_pages(event['result'])
             self.log(f'{job.source.name} · '+('추가 검토 필요' if job.status=='needs_review' else '완료'))
+            if job.review_required_pages:
+                self.log(f'{job.source.name} · {review_message(job.review_required_pages)}')
             self.connections.refresh_all()
         elif kind in ('file_failed','file_stopped'):
             job.status='failed' if kind=='file_failed' else 'stopped'
@@ -243,6 +247,9 @@ class MainWindow(QMainWindow):
         self.progress.title.setText('전체 진행 · 실행 종료')
         self.statusBar().showMessage('실행 종료 · 완료/실패 목록과 검토 보고서를 확인하세요.')
         self.refresh()
+        for job in self.jobs:
+            if job.status == 'needs_review' and job.review_required_pages:
+                self.log(f'{job.source.name} · {review_message(job.review_required_pages)}')
         if self.closing: QTimer.singleShot(0,self.close)
 
     def closeEvent(self,event):

@@ -1,6 +1,7 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTabWidget, QTreeWidget, QTreeWidgetItem
 from ..models import STATES
+from ..review_summary import review_message
 
 
 class FileTree(QTreeWidget):
@@ -73,6 +74,10 @@ class FilesPanel(QWidget):
             slides=f'{job.slides} slides' if job.slides is not None else '분석 대기'
             item=QTreeWidgetItem([f'{job.source.name}\n{slides} · {STATES.get(job.status,job.status)}'])
             item.setData(0,Qt.ItemDataRole.UserRole,job.id); item.setToolTip(0,str(job.source))
+            if finished and job.review_required_pages:
+                summary=review_message(job.review_required_pages)
+                item.setText(0,item.text(0)+'\n'+summary)
+                item.setToolTip(0,str(job.source)+'\n'+summary)
             tree.addTopLevelItem(item)
             if job.id==selected: tree.setCurrentItem(item)
         for tree in (self.queue,self.done): tree.blockSignals(False)

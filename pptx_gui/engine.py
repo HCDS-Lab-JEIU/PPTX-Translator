@@ -18,6 +18,7 @@ from .adapters.codex import CodexConnectionAdapter
 from .adapters.gemini import GeminiConnectionAdapter
 from .adapters.antigravity import AntigravityConnectionAdapter
 from .adapters.base import safe_error
+from .review_summary import review_pages
 
 
 class Stopped(Exception): pass
@@ -334,6 +335,7 @@ class DesktopEngine:
             'application_report':state['application_report'],
             'preserved_unsupported_shapes':document.get('preserved_unsupported_shapes', []),
             'checkpoint':str(state_file)}
+        result['review_required_pages'] = review_pages(result)
         with target.with_suffix('.report.json').open('x',encoding='utf-8') as output_report:
             json.dump(result,output_report,ensure_ascii=False,indent=2)
         state['result'] = result; save_state()

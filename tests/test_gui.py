@@ -14,6 +14,7 @@ from pptx_gui.adapters.base import safe_error
 from pptx_gui.engine import DesktopEngine,RunControl,Stopped,QuotaPause
 from pptx_pipeline.ai import AIResponse
 from main import file_sha256
+from pptx_gui.review_summary import review_pages
 
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 try:
@@ -27,6 +28,16 @@ except ImportError:
 
 
 class DesktopDataTests(unittest.TestCase):
+    def test_review_pages_combine_findings_without_resolved_or_formatting_only_pages(self):
+        result = {'translation_failed_pages':[7, 2],
+            'application_report':{'kept_original':[{'page':3}], 'formatting_deferred':[{'page':6}]},
+            'preserved_unsupported_shapes':[{'page':5}],
+            'review_reports':[{'page':2,'status':'needs_review'},
+                              {'page':4,'status':'needs_review','text_compressed':True},
+                              {'page':1,'status':'verified'}]}
+        self.assertEqual(review_pages(result), [2,3,4,5,7])
+        self.assertEqual(review_pages({}), [])
+
     def test_save_name_and_original_protection(self):
         with TemporaryDirectory() as tmp:
             src=Path(tmp)/'Lecture.pptx'
@@ -149,6 +160,16 @@ class DesktopWidgetTests(unittest.TestCase):
         self.window.select_node('save')
         from PySide6.QtWidgets import QLabel
         self.assertTrue(any('example_영어.pptx' in label.text() for label in self.window.inspector.findChildren(QLabel)))
+    def test_completed_file_shows_review_pages_in_list_and_final_log(self):
+        job=self.window.jobs[0]
+        self.window.on_event({'type':'file_done','job':job.id,'result':{
+            'status':'needs_review','output':'','slides':6,'translation_failed_pages':[5,2],
+            'review_reports':[{'page':2,'status':'needs_review'}]}})
+        item=self.window.files.done.topLevelItem(0)
+        self.assertIn('검토 필요 페이지: 2, 5',item.text(0))
+        self.assertIn('검토 필요 페이지: 2, 5',item.toolTip(0))
+        self.window.runner_finished()
+        self.assertIn('검토 필요 페이지: 2, 5',self.window.pipeline.log.toPlainText().splitlines()[-1])
     def test_antigravity_can_be_selected_for_translation_and_layout(self):
         self.window.inspector.provider_changed('antigravity')
         self.assertEqual(self.window.settings.translate.model,'demo-agy')

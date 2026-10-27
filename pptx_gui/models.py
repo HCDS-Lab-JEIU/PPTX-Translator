@@ -113,6 +113,7 @@ class FileJob:
     workdir: str = ""
     demo: bool = False
     node_states: dict = field(default_factory=lambda: {n: "ready" for n in NODES})
+    review_required_pages: list[int] = field(default_factory=list)
 
 
 def validate_model(settings, connection):
