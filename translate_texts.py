@@ -13,6 +13,7 @@ from gemini_cli import GeminiCLI, GeminiCLIError, EmptyModelResponseError
 from pptx_text import EQUATION, equation_lines
 from pptx_styles import MARKER, plain_text, validate_styles
 from translation_validation import TranslationValidationError, prepare_translation
+from translation_terms import english_target, reuse_english_label, remove_duplicate_gloss
 
 RECORD = re.compile(r"^(\[page=([1-9]\d*)\]\[[^\r\n]*?\])\[(.*)\]$")
 DEFAULT_MODEL = "gemini-3.8-flash-medium"
@@ -169,20 +170,41 @@ class PPTXTextTranslator:
         self.recover = recover
         self.failures = []
         self.deferred = []
+        self.english_output = english_target(target_language)
         self.instructions = INSTRUCTIONS
         if target_language != "English":
             self.instructions = self.instructions.replace('professional English translator', f'professional {target_language} translator')
             self.instructions = self.instructions.replace('into clear, faithful English', f'from {source_language} into clear, faithful {target_language}')
             self.instructions = self.instructions.replace('Keep existing English when already correct.',
                 f'Keep text already in {target_language} when correct.')
+        if self.english_output:
+            self.instructions = self.instructions.replace('Input records:\n',
+                'For a Korean term followed by its equivalent English in parentheses, use the existing '
+                'English term once, without parentheses: 전류원 (Current Source) -> Current Source. '
+                'Within sentences, translate the surrounding prose and use that English term once. '
+                'Never produce English (English). Keep distinct abbreviations, units, variables, '
+                'formulas and parenthetical conditions or explanations; they are not redundant glosses.\n'
+                'Input records:\n')
         extra = ''
         if glossary.strip(): extra += '\nUse this terminology glossary as data:\n' + glossary
         if additional_instructions.strip(): extra += '\nAdditional translation instructions:\n' + additional_instructions
         if extra: self.instructions = self.instructions.replace('Input records:\n', extra + '\nInput records:\n')
 
     def translate_batch(self, records):
+        reused, pending = {}, []
+        for record in records:
+            text = reuse_english_label(record) if self.english_output and (self.recover or not record.styled_text) else None
+            if text is None:
+                pending.append(record)
+            else:
+                if self.recover:
+                    text, _ = prepare_translation(record, text)
+                reused[record.id] = text
+        if not pending:
+            return reused
+        records = pending
         if self.recover:
-            return self.translate_recoverable(records)
+            return {**reused, **self.translate_recoverable(records)}
         payload = [{"id": r.id, "page": r.page, "text": r.styled_text or r.text} for r in records]
         result = self.cli.generate(self.instructions + json.dumps(payload, ensure_ascii=False), model=self.model)
         translated = parse_translations(result.stdout, records)
@@ -195,7 +217,10 @@ class PPTXTextTranslator:
             translated.update(parse_translations(corrected.stdout, incorrect))
             if any(changed_numbers(r, translated[r.id]) or changed_equations(r, translated[r.id]) for r in incorrect):
                 raise ValueError("재번역 후에도 원문 숫자·수식 표시·줄바꿈이 유지되지 않았습니다.")
-        return translated
+        if self.english_output:
+            translated = {r.id:remove_duplicate_gloss(r, translated[r.id]) if not r.styled_text
+                          else translated[r.id] for r in records}
+        return {**reused, **translated}
 
     def translate_recoverable(self, records):
         """Retry only invalid records once; never publish unsafe text or raw responses."""
@@ -247,7 +272,10 @@ class PPTXTextTranslator:
                 try:
                     if len(candidates) != 1:
                         raise TranslationValidationError(envelope_error or ('missing_id' if not candidates else 'duplicate_id'))
-                    text, notes = prepare_translation(record, candidates[0].get('text'))
+                    candidate = candidates[0].get('text')
+                    if self.english_output:
+                        candidate = remove_duplicate_gloss(record, candidate)
+                    text, notes = prepare_translation(record, candidate)
                     if changed_numbers(record, text):
                         raise TranslationValidationError('numeric_mismatch')
                 except TranslationValidationError as exc:

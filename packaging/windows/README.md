@@ -45,6 +45,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File packaging/windows/verify.ps1
 
 Python이 없는 별도 Windows PC에서도 압축 해제·GUI 실행·파일 선택을 확인하세요. 실제 CLI 자동 탐색·로그인과 작은 PPT의 번역·조정 생략·선택적 PowerPoint 조정·저장·원본 보존도 확인해야 합니다. 개발 PC의 데모 성공만으로 별도 PC 검증을 대체하지 않습니다.
 
-확인한 빌드: `v0.2.3-alpha`, Windows x64, Python 3.13, PyInstaller 6.22.3. 격리 환경에서 회귀 테스트 125개가 통과했으며, PATH·PYTHONHOME·PYTHONPATH를 비운 상태에서 EXE 데모의 화면 생성과 정상 종료를 확인했습니다. ZIP CRC·배포 폴더와 ZIP 내용 일치·렌더링 스크립트 및 번역 서식 복구/전체 선별/문장 압축/렌더링 캐시 모듈과 미지원 삽입 개체 필터·문단 표시 순서 수정 포함을 확인했습니다. 실제 사용자 원본·인증 파일·외부 CLI는 포함하지 않으며, 라이브러리 리소스인 `pptx/templates/default.pptx`는 포함합니다. 배포 ZIP 옆의 `SHA256SUMS.txt`로 무결성을 확인할 수 있습니다. 별도 PC의 실제 AI·PowerPoint 전체 흐름은 아직 검증하지 않았습니다.
+확인한 빌드: `v0.3.0-alpha`, Windows x64, Python 3.13, PyInstaller 6.22.3. 격리 환경에서 회귀 테스트 150개가 통과했으며, PATH·PYTHONHOME·PYTHONPATH를 비운 상태에서 EXE 데모의 화면 생성과 정상 종료를 확인했습니다. 약 63MiB ZIP의 CRC·배포 폴더와의 일치, PDF 전체 예측·단계별 조정·영문 병기 재사용 모듈 포함과 번들 PDFium DLL의 로드·문서 생성·종료를 확인했습니다. 실제 사용자 원본·인증 파일·외부 CLI는 포함하지 않으며, 라이브러리 리소스인 `pptx/templates/default.pptx`는 포함합니다. 배포 ZIP 옆의 `SHA256SUMS.txt`로 무결성을 확인할 수 있습니다. 별도 PC의 실제 AI·PowerPoint 전체 흐름은 아직 검증하지 않았습니다.
 
 Windows에서 빌드하며 [폴더 배포](https://pyinstaller.org/en/stable/operating-mode.html), [spec 데이터 포함](https://pyinstaller.org/en/stable/spec-files.html), [리소스 경로](https://pyinstaller.org/en/stable/runtime-information.html)는 PyInstaller 공식 문서를 따릅니다. 공개 배포 전 포함 라이브러리의 라이선스와 배포 조건도 확인해야 합니다.
